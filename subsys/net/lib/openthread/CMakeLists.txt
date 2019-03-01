@@ -219,7 +219,6 @@ zephyr_include_directories(${ot_platforms_dir})
 
 # Determine which libs should be linked in
 set(ot_libs
-  openthread-platform-utils
   mbedcrypto
   )
 if(CONFIG_OPENTHREAD_FTD)

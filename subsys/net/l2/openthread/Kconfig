@@ -15,6 +15,7 @@ menuconfig NET_L2_OPENTHREAD
 	depends on FLASH_PAGE_LAYOUT
 	depends on CPLUSPLUS
 	depends on REBOOT
+	depends on FILE_SYSTEM
 	select OPENTHREAD_PLAT
 
 if NET_L2_OPENTHREAD
