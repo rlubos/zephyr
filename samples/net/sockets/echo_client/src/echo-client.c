@@ -137,38 +137,42 @@ void main(void)
 
 	init_app();
 
-	if (IS_ENABLED(CONFIG_NET_TCP)) {
-		ret = start_tcp();
-		if (ret < 0) {
-			goto quit;
-		}
-	}
+//	if (IS_ENABLED(CONFIG_NET_TCP)) {
+//		ret = start_tcp();
+//		if (ret < 0) {
+//			goto quit;
+//		}
+//	}
+//
+//	if (IS_ENABLED(CONFIG_NET_UDP)) {
+//		ret = start_udp();
+//		if (ret < 0) {
+//			goto quit;
+//		}
+//	}
+//
+//	prepare_fds();
+//
+//	while (true) {
+//		if (IS_ENABLED(CONFIG_NET_TCP)) {
+//			ret = process_tcp();
+//			if (ret < 0) {
+//				goto quit;
+//			}
+//		}
+//
+//		if (IS_ENABLED(CONFIG_NET_UDP)) {
+//			ret = process_udp();
+//			if (ret < 0) {
+//				goto quit;
+//			}
+//		}
+//
+//		wait();
+//	}
 
-	if (IS_ENABLED(CONFIG_NET_UDP)) {
-		ret = start_udp();
-		if (ret < 0) {
-			goto quit;
-		}
-	}
-
-	prepare_fds();
-
-	while (true) {
-		if (IS_ENABLED(CONFIG_NET_TCP)) {
-			ret = process_tcp();
-			if (ret < 0) {
-				goto quit;
-			}
-		}
-
-		if (IS_ENABLED(CONFIG_NET_UDP)) {
-			ret = process_udp();
-			if (ret < 0) {
-				goto quit;
-			}
-		}
-
-		wait();
+	while (1) {
+		k_sleep(K_MSEC(1000));
 	}
 
 quit:
