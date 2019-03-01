@@ -598,4 +598,6 @@ static int nffs_init(struct device *dev)
 	return fs_register(FS_NFFS, &nffs_fs);
 }
 
-SYS_INIT(nffs_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
+#define FS_INIT_PRIO 70
+
+SYS_INIT(nffs_init, POST_KERNEL, FS_INIT_PRIO);
