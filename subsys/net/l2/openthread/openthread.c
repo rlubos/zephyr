@@ -302,13 +302,17 @@ static int openthread_init(struct net_if *iface)
 	NET_INFO("OpenThread version: %s",
 		    otGetVersionString());
 
-	otThreadSetNetworkName(ot_context->instance, CONFIG_OPENTHREAD_NETWORK_NAME);
-	NET_INFO("Network name:   %s",
-		 log_strdup(otThreadGetNetworkName(ot_context->instance)));
+	/* Set defaults only when there is no valid dataset. */
+	if (!otDatasetIsCommissioned(ot_context->instance)) {
+		otThreadSetNetworkName(ot_context->instance, CONFIG_OPENTHREAD_NETWORK_NAME);
+		NET_INFO("Network name:   %s",
+			 log_strdup(otThreadGetNetworkName(ot_context->instance)));
 
-	otLinkSetChannel(ot_context->instance, CONFIG_OPENTHREAD_CHANNEL);
-	otLinkSetPanId(ot_context->instance, CONFIG_OPENTHREAD_PANID);
-	otThreadSetExtendedPanId(ot_context->instance, &xpanid);
+		otLinkSetChannel(ot_context->instance, CONFIG_OPENTHREAD_CHANNEL);
+		otLinkSetPanId(ot_context->instance, CONFIG_OPENTHREAD_PANID);
+		otThreadSetExtendedPanId(ot_context->instance, &xpanid);
+	}
+
 	otIp6SetEnabled(ot_context->instance, true);
 	otThreadSetEnabled(ot_context->instance, true);
 	otIp6SetReceiveFilterEnabled(ot_context->instance, true);
