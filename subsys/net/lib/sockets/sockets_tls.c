@@ -605,12 +605,28 @@ static int tls_add_ca_certificate(struct tls_context *tls,
 	return -ENOTSUP;
 }
 
+const mbedtls_x509_crt_profile mbedtls_x509_crt_profile_zephyr =
+{
+#if defined(MBEDTLS_TLS_DEFAULT_ALLOW_SHA1_IN_CERTIFICATES)
+    /* Allow SHA-1 (weak, but still safe in controlled environments) */
+    MBEDTLS_X509_ID_FLAG( MBEDTLS_MD_SHA1 ) |
+#endif
+    /* Only SHA-2 hashes */
+    MBEDTLS_X509_ID_FLAG( MBEDTLS_MD_SHA224 ) |
+    MBEDTLS_X509_ID_FLAG( MBEDTLS_MD_SHA256 ) |
+    MBEDTLS_X509_ID_FLAG( MBEDTLS_MD_SHA384 ) |
+    MBEDTLS_X509_ID_FLAG( MBEDTLS_MD_SHA512 ),
+    0xFFFFFFF, /* Any PK alg    */
+    0xFFFFFFF, /* Any curve     */
+    1024,
+};
+
 static void tls_set_ca_chain(struct tls_context *tls)
 {
 #if defined(MBEDTLS_X509_CRT_PARSE_C)
 	mbedtls_ssl_conf_ca_chain(&tls->config, &tls->ca_chain, NULL);
 	mbedtls_ssl_conf_cert_profile(&tls->config,
-				      &mbedtls_x509_crt_profile_default);
+				      &mbedtls_x509_crt_profile_zephyr);
 #endif /* MBEDTLS_X509_CRT_PARSE_C */
 }
 
