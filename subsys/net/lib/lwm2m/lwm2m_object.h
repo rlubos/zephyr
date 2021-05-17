@@ -444,7 +444,11 @@ typedef void (*lwm2m_message_timeout_cb_t)(struct lwm2m_message *msg);
 
 /* Internal LwM2M message structure to track in-flight messages. */
 struct lwm2m_message {
-	sys_snode_t node;
+	union {
+		/** FIFO uses first word itself, reserve space */
+		intptr_t _unused;
+		sys_snode_t node;
+	};
 
 	/** LwM2M context related to this message */
 	struct lwm2m_ctx *ctx;

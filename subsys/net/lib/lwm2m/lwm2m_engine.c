@@ -114,6 +114,12 @@ static K_KERNEL_STACK_DEFINE(engine_thread_stack,
 			      CONFIG_LWM2M_ENGINE_STACK_SIZE);
 static struct k_thread engine_thread_data;
 
+#if IS_ENABLED(CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD)
+static K_FIFO_DEFINE(engine_tx_fifo);
+static K_KERNEL_STACK_DEFINE(engine_tx_stack, CONFIG_LWM2M_ENGINE_STACK_SIZE);
+static struct k_thread engine_tx_thread;
+#endif /* CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD */
+
 #define MAX_POLL_FD		CONFIG_NET_SOCKETS_POLL_MAX
 
 static struct lwm2m_ctx *sock_ctx[MAX_POLL_FD];
@@ -4611,8 +4617,15 @@ static int socket_send_message(struct lwm2m_ctx *client_ctx)
 	if (!msg_node) {
 		return 0;
 	}
+
 	msg = SYS_SLIST_CONTAINER(msg_node, msg, node);
+
+#if IS_ENABLED(CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD)
+	k_fifo_put(&engine_tx_fifo, msg);
+	return 0;
+#else
 	return lwm2m_send_message(msg);
+#endif /* CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD */
 }
 
 static void socket_reset_pollfd_events(void)
@@ -4695,6 +4708,23 @@ static void socket_loop(void)
 		}
 	}
 }
+
+#if IS_ENABLED(CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD)
+static void socket_send_loop(void)
+{
+	int rc;
+	struct lwm2m_message *msg;
+
+	while (true) {
+		msg = k_fifo_get(&engine_tx_fifo, K_FOREVER);
+
+		rc = lwm2m_send_message(msg);
+		if (rc < 0) {
+			LOG_ERR("Failed to transmit LwM2M message, err: %d", rc);
+		}
+	}
+}
+#endif /* CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD */
 
 #if defined(CONFIG_LWM2M_DTLS_SUPPORT)
 static int load_tls_credential(struct lwm2m_ctx *client_ctx, uint16_t res_id,
@@ -4944,6 +4974,16 @@ static int lwm2m_engine_init(const struct device *dev)
 			THREAD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&engine_thread_data, "lwm2m-sock-recv");
 	LOG_DBG("LWM2M engine socket receive thread started");
+
+#if IS_ENABLED(CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD)
+	/* start sock transmit thread */
+	k_thread_create(&engine_tx_thread, &engine_tx_stack[0],
+			K_KERNEL_STACK_SIZEOF(engine_thread_stack),
+			(k_thread_entry_t) socket_send_loop,
+			NULL, NULL, NULL, THREAD_PRIORITY,
+			0, K_NO_WAIT);
+	k_thread_name_set(&engine_tx_thread, "lwm2m-sock-send");
+#endif /* CONFIG_LWM2M_ENGINE_SEPARATE_TX_THREAD */
 
 	return 0;
 }

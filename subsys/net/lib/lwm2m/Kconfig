@@ -17,6 +17,16 @@ module-dep = LOG
 module-str = Log level for LWM2M library
 source "subsys/net/Kconfig.template.log_config.net"
 
+config LWM2M_ENGINE_SEPARATE_TX_THREAD
+	bool "Use separate thread for TX operations"
+	default y if SOC_SERIES_NRF91X
+	help
+	  Enabling this config will set up a separate thread for LwM2M TX
+	  operations. The purpose of this config is to workaround a bug in nRF91
+	  socket implementation, where filling up the RX queue could cause a
+	  stall in the send() function, causing a deadlock in the LwM2M
+	  processing thread.
+
 config LWM2M_DTLS_SUPPORT
 	bool "Enable DTLS support in the LwM2M client"
 	select TLS_CREDENTIALS
