@@ -1060,7 +1060,9 @@ static int ppp_start(const struct device *dev)
 	}
 #endif /* !CONFIG_NET_TEST */
 
-	net_ppp_carrier_on(context->iface);
+	if (!IS_ENABLED(CONFIG_MODEM_GSM_PPP)) {
+		net_ppp_carrier_on(context->iface);
+	}
 
 	return 0;
 }

@@ -242,8 +242,6 @@ static int ppp_enable(struct net_if *iface, bool state)
 
 		if (ctx->is_startup_pending) {
 			ctx->is_enable_done = true;
-		} else {
-			start_ppp(ctx);
 		}
 	}
 
@@ -283,6 +281,11 @@ static void carrier_on_off(struct k_work *work)
 	if (ppp_carrier_up) {
 		ppp_mgmt_raise_carrier_on_event(ctx->iface);
 		net_if_carrier_on(ctx->iface);
+
+		if (!ctx->is_startup_pending) {
+			/* Should dormant be set to ON until the operation finishes? */
+			start_ppp(ctx);
+		}
 	} else {
 		if (ppp_lcp) {
 			ppp_lcp->close(ctx, "Shutdown");
