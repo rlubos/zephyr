@@ -859,8 +859,8 @@ Networking
 
 * The DNS resolver and mDNS/LLMNR responders are converted to use socket service API.
   This means that the number of pollable sockets in the system might need to be increased.
-  Please check that the values of :kconfig:option:`CONFIG_NET_SOCKETS_POLL_MAX` and
-  :kconfig:option:`CONFIG_POSIX_MAX_FDS` are high enough. Unfortunately no exact values
+  Please check that the values of :kconfig:option:`CONFIG_ZVFS_POLL_MAX` and
+  :kconfig:option:`CONFIG_ZVFS_OPEN_MAX` are high enough. Unfortunately no exact values
   for these can be given as it depends on application needs and usage. (:github:`72834`)
 
 * The packet socket (type ``AF_PACKET``) protocol field in ``socket`` API call has changed.
