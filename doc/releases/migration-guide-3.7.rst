@@ -875,6 +875,9 @@ Networking
   :kconfig:option:`PSA_WANT_ALG_SHA_256` instead of legacy ``CONFIG_MBEDTLS_*``
   features. (:github:`71827`)
 
+* The Kconfig ``CONFIG_NET_SOCKETS_POLL_MAX`` has been deprecated and replaced
+  with :kconfig:option:`CONFIG_ZVFS_POLL_MAX` option. Use the new option instead.
+
 Other Subsystems
 ****************
 
