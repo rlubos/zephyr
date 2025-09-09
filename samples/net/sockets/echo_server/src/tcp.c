@@ -13,7 +13,7 @@ LOG_MODULE_DECLARE(net_echo_server_sample, LOG_LEVEL_DBG);
 #include <zephyr/kernel.h>
 #include <errno.h>
 #include <stdio.h>
-
+#include <sys/select.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/tls_credentials.h>
 
@@ -150,8 +150,8 @@ static void handle_data(void *ptr1, void *ptr2, void *ptr3)
 		received = recv(client,
 			data->tcp.accepted[slot].recv_buffer + offset,
 			sizeof(data->tcp.accepted[slot].recv_buffer) - offset,
-			0);
-
+			MSG_WAITALL);
+		k_sleep(K_MSEC(30));
 		if (received == 0) {
 			/* Connection closed */
 			LOG_INF("TCP (%s): Connection closed", data->proto);
@@ -376,51 +376,91 @@ static void print_stats(struct k_work *work)
 	k_work_reschedule(&data->tcp.stats_print, K_SECONDS(STATS_TIMER));
 }
 
+static void handle_echo(int client)
+{
+    char buf[128];
+    int rc;
+
+    rc = recv(client, buf, sizeof(buf), MSG_WAITALL);
+    if (rc <= 0) {
+        if (rc == 0) {
+            LOG_INF("Client closed connection");
+        } else {
+            LOG_ERR("recv() failed, errno=%d", errno);
+        }
+        return;
+    }
+
+    for (int k = 0; k < 10000; k++) { continue; }
+
+    LOG_INF("Echoing %d bytes", rc);
+    send(client, buf, rc, 0);
+}
+
 void start_tcp(void)
 {
-	int i;
+    int server, client;
+    struct sockaddr_in addr;
+    fd_set fdset;
+    struct timeval timeout;
+    int rc;
 
-	for (i = 0; i < CONFIG_NET_SAMPLE_NUM_HANDLERS; i++) {
-		conf.ipv6.tcp.accepted[i].sock = -1;
-		conf.ipv4.tcp.accepted[i].sock = -1;
+    server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server < 0) {
+        LOG_ERR("socket() failed, errno=%d", errno);
+        return;
+    }
 
-#if defined(CONFIG_NET_IPV4)
-		tcp4_handler_in_use[i] = false;
-#endif
-#if defined(CONFIG_NET_IPV6)
-		tcp6_handler_in_use[i] = false;
-#endif
-	}
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(MY_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-#if defined(CONFIG_NET_IPV6)
-#if defined(CONFIG_USERSPACE)
-	k_mem_domain_add_thread(&app_domain, tcp6_thread_id);
+    if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        LOG_ERR("bind() failed, errno=%d", errno);
+        close(server);
+        return;
+    }
 
-	for (i = 0; i < CONFIG_NET_SAMPLE_NUM_HANDLERS; i++) {
-		k_thread_access_grant(tcp6_thread_id, &tcp6_handler_thread[i]);
-		k_thread_access_grant(tcp6_thread_id, &tcp6_handler_stack[i]);
-	}
-#endif
+    if (listen(server, 1) < 0) {
+        LOG_ERR("listen() failed, errno=%d", errno);
+        close(server);
+        return;
+    }
 
-	k_work_init_delayable(&conf.ipv6.tcp.stats_print, print_stats);
-	k_thread_start(tcp6_thread_id);
-	k_work_reschedule(&conf.ipv6.tcp.stats_print, K_SECONDS(STATS_TIMER));
-#endif
+    LOG_INF("Echo server listening on port %d", MY_PORT);
 
-#if defined(CONFIG_NET_IPV4)
-#if defined(CONFIG_USERSPACE)
-	k_mem_domain_add_thread(&app_domain, tcp4_thread_id);
+    for (;;) {
+        FD_ZERO(&fdset);
+        FD_SET(server, &fdset);
 
-	for (i = 0; i < CONFIG_NET_SAMPLE_NUM_HANDLERS; i++) {
-		k_thread_access_grant(tcp4_thread_id, &tcp4_handler_thread[i]);
-		k_thread_access_grant(tcp4_thread_id, &tcp4_handler_stack[i]);
-	}
-#endif
+        timeout.tv_sec = 1;   /* wake up every 1s */
+        timeout.tv_usec = 0;
 
-	k_work_init_delayable(&conf.ipv4.tcp.stats_print, print_stats);
-	k_thread_start(tcp4_thread_id);
-	k_work_reschedule(&conf.ipv4.tcp.stats_print, K_SECONDS(STATS_TIMER));
-#endif
+        rc = select(server + 1, &fdset, NULL, NULL, &timeout);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERR("select() failed, errno=%d", errno);
+            break;
+        }
+        if (rc == 0) {
+            /* timeout: let other threads run */
+            k_sleep(K_MSEC(50));
+            continue;
+        }
+
+        if (FD_ISSET(server, &fdset)) {
+            client = accept(server, NULL, NULL);
+            if (client < 0) {
+                LOG_ERR("accept() failed, errno=%d", errno);
+                continue;
+            }
+            handle_echo(client);
+            close(client);
+        }
+    }
+
+    close(server);
 }
 
 void stop_tcp(void)
