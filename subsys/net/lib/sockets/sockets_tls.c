@@ -123,6 +123,38 @@ struct tls_dtls_cid {
 };
 #endif
 
+struct tls_session_context {
+	sys_snode_t node;
+
+	/* Handshake completion time. */
+	int64_t handshake_timestamp;
+
+	/* Information whether TLS handshake is currently in progress. */
+	bool handshake_in_progress : 1;
+
+	/* Session ended at the TLS/DTLS level. */
+	bool session_closed : 1;
+
+	/* Information whether TLS handshake is complete or not. */
+	struct k_sem tls_established;
+
+#if defined(CONFIG_MBEDTLS)
+	/* mbedTLS context. */
+	mbedtls_ssl_context ssl;
+#endif /* CONFIG_MBEDTLS */
+
+#if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+	/* Context information for DTLS timing. */
+	struct dtls_timing_context dtls_timing;
+
+	/* DTLS peer address. */
+	struct sockaddr dtls_peer_addr;
+
+	/* DTLS peer address length. */
+	socklen_t dtls_peer_addrlen;
+#endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
+};
+
 /** TLS context information. */
 __net_socket struct tls_context {
 	/** Underlying TCP/UDP socket. */
@@ -137,11 +169,16 @@ __net_socket struct tls_context {
 	/** Information whether underlying socket is listening. */
 	bool is_listening : 1;
 
-	/** Information whether TLS handshake is currently in progress. */
-	bool handshake_in_progress : 1;
+	/* TLS sessions associated with this socket. In most cases there will
+	 * be one session allocated per TLS context. DTLS server is an exception,
+	 * which can have multiple TLS sessions allocated at the same time.
+	 */
+	sys_slist_t sessions;
 
-	/** Session ended at the TLS/DTLS level. */
-	bool session_closed : 1;
+	/* Currently active TLS session. For a TLS context in use, this should
+	 * always point to a valid session instance.
+	 */
+	struct tls_session_context *active_session;
 
 	/** Socket type. */
 	enum net_sock_type type;
@@ -154,9 +191,6 @@ __net_socket struct tls_context {
 
 	/* Indicates whether socket is in error state at TLS/DTLS level. */
 	int error;
-
-	/** Information whether TLS handshake is complete or not. */
-	struct k_sem tls_established;
 
 	/* TLS socket mutex lock. */
 	struct k_mutex *lock;
@@ -214,23 +248,11 @@ __net_socket struct tls_context {
 	} options;
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-	/** Context information for DTLS timing. */
-	struct dtls_timing_context dtls_timing;
-
 	/** mbedTLS cookie context for DTLS */
 	mbedtls_ssl_cookie_ctx cookie;
-
-	/** DTLS peer address. */
-	struct sockaddr dtls_peer_addr;
-
-	/** DTLS peer address length. */
-	socklen_t dtls_peer_addrlen;
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 
 #if defined(CONFIG_MBEDTLS)
-	/** mbedTLS context. */
-	mbedtls_ssl_context ssl;
-
 	/** mbedTLS configuration. */
 	mbedtls_ssl_config config;
 
@@ -244,13 +266,19 @@ __net_socket struct tls_context {
 	/** mbedTLS structure for own private key. */
 	mbedtls_pk_context priv_key;
 #endif /* MBEDTLS_X509_CRT_PARSE_C */
-
 #endif /* CONFIG_MBEDTLS */
 };
 
 
 /* A global pool of TLS contexts. */
 static struct tls_context tls_contexts[CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS];
+K_MEM_SLAB_DEFINE_STATIC(tls_session_contexts, sizeof(struct tls_session_context),
+			 CONFIG_NET_SOCKETS_TLS_MAX_SESSION_CONTEXTS,
+			 __alignof__(struct tls_session_context));
+
+BUILD_ASSERT(CONFIG_NET_SOCKETS_TLS_MAX_SESSION_CONTEXTS >= CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS,
+	     "CONFIG_NET_SOCKETS_TLS_MAX_SESSION_CONTEXTS cannot be smaller than "
+	     "CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS");
 
 static struct tls_session_cache client_cache[CONFIG_NET_SOCKETS_TLS_MAX_CLIENT_SESSION_COUNT];
 
@@ -340,9 +368,9 @@ static int dtls_timing_get_delay(void *data)
 	return 0;
 }
 
-static int dtls_get_remaining_timeout(struct tls_context *ctx)
+static int dtls_get_remaining_timeout(struct tls_session_context *session_ctx)
 {
-	struct dtls_timing_context *timing = &ctx->dtls_timing;
+	struct dtls_timing_context *timing = &session_ctx->dtls_timing;
 	uint32_t elapsed_ms;
 
 	elapsed_ms = k_uptime_get_32() - timing->snapshot;
@@ -382,9 +410,9 @@ static int tls_init(void)
 
 SYS_INIT(tls_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
-static inline bool is_handshake_complete(struct tls_context *ctx)
+static inline bool is_handshake_complete(struct tls_session_context *session_ctx)
 {
-	return k_sem_count_get(&ctx->tls_established) != 0;
+	return k_sem_count_get(&session_ctx->tls_established) != 0;
 }
 
 /*
@@ -440,6 +468,29 @@ static inline void tls_set_max_frag_len(mbedtls_ssl_config *config, enum net_soc
 static inline void tls_set_max_frag_len(mbedtls_ssl_config *config, enum net_sock_type type) {}
 #endif
 
+static struct tls_session_context *tls_session_alloc(void)
+{
+	struct tls_session_context *session_ctx = NULL;
+
+	if (k_mem_slab_alloc(&tls_session_contexts, (void **)&session_ctx,
+			     K_NO_WAIT) != 0) {
+		NET_WARN("Failed to allocate TLS session context");
+		return NULL;
+	}
+
+	(void)memset(session_ctx, 0, sizeof(*session_ctx));
+	(void)k_sem_init(&session_ctx->tls_established, 0, 1);
+	mbedtls_ssl_init(&session_ctx->ssl);
+
+	return session_ctx;
+}
+
+static void tls_session_free(struct tls_session_context * session_ctx)
+{
+	mbedtls_ssl_free(&session_ctx->ssl);
+	k_mem_slab_free(&tls_session_contexts, (void *)session_ctx);
+}
+
 /* Allocate TLS context. */
 static struct tls_context *tls_alloc(void)
 {
@@ -451,12 +502,24 @@ static struct tls_context *tls_alloc(void)
 	for (i = 0; i < ARRAY_SIZE(tls_contexts); i++) {
 		if (!tls_contexts[i].is_used) {
 			tls = &tls_contexts[i];
+
 			(void)memset(tls, 0, sizeof(*tls));
+
+			/* Allocate initial (and in most cases the only) session context */
+			tls->active_session = tls_session_alloc();
+			if (tls->active_session == NULL) {
+				tls = NULL;
+				break;
+			}
+
 			tls->is_used = true;
 			tls->options.verify_level = -1;
 			tls->options.timeout_tx = K_FOREVER;
 			tls->options.timeout_rx = K_FOREVER;
 			tls->sock = -1;
+
+			sys_slist_init(&tls->sessions);
+			sys_slist_append(&tls->sessions, &tls->active_session->node);
 
 			NET_DBG("Allocated TLS context, %p", tls);
 			break;
@@ -466,9 +529,6 @@ static struct tls_context *tls_alloc(void)
 	k_mutex_unlock(&context_lock);
 
 	if (tls) {
-		k_sem_init(&tls->tls_established, 0, 1);
-
-		mbedtls_ssl_init(&tls->ssl);
 		mbedtls_ssl_config_init(&tls->config);
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 		mbedtls_ssl_cookie_init(&tls->cookie);
@@ -514,8 +574,8 @@ static struct tls_context *tls_clone(struct tls_context *source_tls)
 
 #if defined(MBEDTLS_X509_CRT_PARSE_C)
 	if (target_tls->options.is_hostname_set) {
-		mbedtls_ssl_set_hostname(&target_tls->ssl,
-					 source_tls->ssl.hostname);
+		mbedtls_ssl_set_hostname(&target_tls->active_session->ssl,
+					 source_tls->active_session->ssl.hostname);
 	}
 #endif
 
@@ -525,6 +585,8 @@ static struct tls_context *tls_clone(struct tls_context *source_tls)
 /* Release TLS context. */
 static int tls_release(struct tls_context *tls)
 {
+	sys_snode_t *node;
+
 	if (!PART_OF_ARRAY(tls_contexts, tls)) {
 		NET_ERR("Invalid TLS context");
 		return -EBADF;
@@ -539,12 +601,18 @@ static int tls_release(struct tls_context *tls)
 	mbedtls_ssl_cookie_free(&tls->cookie);
 #endif
 	mbedtls_ssl_config_free(&tls->config);
-	mbedtls_ssl_free(&tls->ssl);
 #if defined(MBEDTLS_X509_CRT_PARSE_C)
 	mbedtls_x509_crt_free(&tls->ca_chain);
 	mbedtls_x509_crt_free(&tls->own_cert);
 	mbedtls_pk_free(&tls->priv_key);
 #endif
+
+	while ((node = sys_slist_get(&tls->sessions)) != NULL) {
+		struct tls_session_context *session_ctx =
+			SYS_SLIST_CONTAINER(node, session_ctx, node);
+
+		tls_session_free(session_ctx);
+	}
 
 	tls->is_used = false;
 
@@ -681,7 +749,7 @@ static void tls_session_store(struct tls_context *context,
 	memcpy(&peer_addr, addr, addrlen);
 	mbedtls_ssl_session_init(&session);
 
-	ret = mbedtls_ssl_get_session(&context->ssl, &session);
+	ret = mbedtls_ssl_get_session(&context->active_session->ssl, &session);
 	if (ret < 0) {
 		NET_ERR("Failed to obtain session for %p", context);
 		goto exit;
@@ -717,7 +785,7 @@ static void tls_session_restore(struct tls_context *context,
 		goto exit;
 	}
 
-	ret = mbedtls_ssl_set_session(&context->ssl, &session);
+	ret = mbedtls_ssl_set_session(&context->active_session->ssl, &session);
 	if (ret < 0) {
 		NET_ERR("Failed to set session for %p", context);
 	}
@@ -823,34 +891,34 @@ static void ctx_set_lock(struct tls_context *ctx, struct k_mutex *lock)
 }
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-static bool dtls_is_peer_addr_valid(struct tls_context *context,
+static bool dtls_is_peer_addr_valid(struct tls_session_context *session_ctx,
 				    const struct sockaddr *peer_addr,
 				    socklen_t addrlen)
 {
-	if (context->dtls_peer_addrlen != addrlen) {
+	if (session_ctx->dtls_peer_addrlen != addrlen) {
 		return false;
 	}
 
-	return peer_addr_cmp(&context->dtls_peer_addr, peer_addr);
+	return peer_addr_cmp(&session_ctx->dtls_peer_addr, peer_addr);
 }
 
-static void dtls_peer_address_set(struct tls_context *context,
+static void dtls_peer_address_set(struct tls_session_context *session_ctx,
 				  const struct sockaddr *peer_addr,
 				  socklen_t addrlen)
 {
-	if (addrlen <= sizeof(context->dtls_peer_addr)) {
-		memcpy(&context->dtls_peer_addr, peer_addr, addrlen);
-		context->dtls_peer_addrlen = addrlen;
+	if (addrlen <= sizeof(session_ctx->dtls_peer_addr)) {
+		memcpy(&session_ctx->dtls_peer_addr, peer_addr, addrlen);
+		session_ctx->dtls_peer_addrlen = addrlen;
 	}
 }
 
-static void dtls_peer_address_get(struct tls_context *context,
+static void dtls_peer_address_get(struct tls_session_context *session_ctx,
 				  struct sockaddr *peer_addr,
 				  socklen_t *addrlen)
 {
-	socklen_t len = MIN(context->dtls_peer_addrlen, *addrlen);
+	socklen_t len = MIN(session_ctx->dtls_peer_addrlen, *addrlen);
 
-	memcpy(peer_addr, &context->dtls_peer_addr, len);
+	memcpy(peer_addr, &session_ctx->dtls_peer_addr, len);
 	*addrlen = len;
 }
 
@@ -860,8 +928,8 @@ static int dtls_tx(void *ctx, const unsigned char *buf, size_t len)
 	ssize_t sent;
 
 	sent = zsock_sendto(tls_ctx->sock, buf, len, ZSOCK_MSG_DONTWAIT,
-			    &tls_ctx->dtls_peer_addr,
-			    tls_ctx->dtls_peer_addrlen);
+			    &tls_ctx->active_session->dtls_peer_addr,
+			    tls_ctx->active_session->dtls_peer_addrlen);
 	if (sent < 0) {
 		if (errno == EAGAIN) {
 			return MBEDTLS_ERR_SSL_WANT_WRITE;
@@ -891,13 +959,13 @@ static int dtls_rx(void *ctx, unsigned char *buf, size_t len)
 		return MBEDTLS_ERR_NET_RECV_FAILED;
 	}
 
-	if (tls_ctx->dtls_peer_addrlen == 0) {
+	if (tls_ctx->active_session->dtls_peer_addrlen == 0) {
 		/* Only allow to store peer address for DTLS servers. */
 		if (tls_ctx->options.role == MBEDTLS_SSL_IS_SERVER) {
-			dtls_peer_address_set(tls_ctx, &addr, addrlen);
+			dtls_peer_address_set(tls_ctx->active_session, &addr, addrlen);
 
 			err = mbedtls_ssl_set_client_transport_id(
-				&tls_ctx->ssl,
+				&tls_ctx->active_session->ssl,
 				(const unsigned char *)&addr, addrlen);
 			if (err < 0) {
 				return err;
@@ -908,7 +976,7 @@ static int dtls_rx(void *ctx, unsigned char *buf, size_t len)
 			 */
 			return MBEDTLS_ERR_SSL_PEER_VERIFY_FAILED;
 		}
-	} else if (!dtls_is_peer_addr_valid(tls_ctx, &addr, addrlen)) {
+	} else if (!dtls_is_peer_addr_valid(tls_ctx->active_session, &addr, addrlen)) {
 		return MBEDTLS_ERR_SSL_WANT_READ;
 	}
 
@@ -1163,16 +1231,19 @@ exit:
 	return err;
 }
 
+/* TODO Make this session reset. */
 static int tls_mbedtls_reset(struct tls_context *context)
 {
 	int ret;
 
-	ret = mbedtls_ssl_session_reset(&context->ssl);
+	ret = mbedtls_ssl_session_reset(&context->active_session->ssl);
 	if (ret != 0) {
 		return ret;
 	}
 
-	k_sem_reset(&context->tls_established);
+	context->active_session->handshake_timestamp = 0;
+
+	k_sem_reset(&context->active_session->tls_established);
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	/* Server role: reset the address so that a new
@@ -1181,9 +1252,9 @@ static int tls_mbedtls_reset(struct tls_context *context)
 	 *              even on handshake timeout
 	 */
 	if (context->options.role == MBEDTLS_SSL_IS_SERVER) {
-		(void)memset(&context->dtls_peer_addr, 0,
-			     sizeof(context->dtls_peer_addr));
-		context->dtls_peer_addrlen = 0;
+		(void)memset(&context->active_session->dtls_peer_addr, 0,
+			     sizeof(context->active_session->dtls_peer_addr));
+		context->active_session->dtls_peer_addrlen = 0;
 	}
 #endif
 
@@ -1196,11 +1267,11 @@ static int tls_mbedtls_handshake(struct tls_context *context,
 	k_timepoint_t end;
 	int ret;
 
-	context->handshake_in_progress = true;
+	context->active_session->handshake_in_progress = true;
 
 	end = sys_timepoint_calc(timeout);
 
-	while ((ret = mbedtls_ssl_handshake(&context->ssl)) != 0) {
+	while ((ret = mbedtls_ssl_handshake(&context->active_session->ssl)) != 0) {
 		if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
 		    ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
 		    ret == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS ||
@@ -1220,7 +1291,7 @@ static int tls_mbedtls_handshake(struct tls_context *context,
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 			if (context->type == SOCK_DGRAM) {
 				int timeout_dtls =
-					dtls_get_remaining_timeout(context);
+					dtls_get_remaining_timeout(context->active_session);
 
 				if (timeout_dtls != SYS_FOREVER_MS) {
 					if (timeout_ms == SYS_FOREVER_MS) {
@@ -1281,14 +1352,16 @@ static int tls_mbedtls_handshake(struct tls_context *context,
 	}
 
 	if (ret == 0) {
-		k_sem_give(&context->tls_established);
+		context->active_session->handshake_timestamp = k_uptime_get();
+		k_sem_give(&context->active_session->tls_established);
 	}
 
-	context->handshake_in_progress = false;
+	context->active_session->handshake_in_progress = false;
 
 	return ret;
 }
 
+/* TODO Split session/config initialization? */
 static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 {
 	int role, type, ret;
@@ -1300,11 +1373,12 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 		MBEDTLS_SSL_TRANSPORT_DATAGRAM;
 
 	if (type == MBEDTLS_SSL_TRANSPORT_STREAM) {
-		mbedtls_ssl_set_bio(&context->ssl, context,
+		mbedtls_ssl_set_bio(&context->active_session->ssl, context,
 				    tls_tx, tls_rx, NULL);
 	} else {
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
-		mbedtls_ssl_set_bio(&context->ssl, context,
+		/* TODO separate bio for server */
+		mbedtls_ssl_set_bio(&context->active_session->ssl, context,
 				    dtls_tx, dtls_rx, NULL);
 #else
 		return -ENOTSUP;
@@ -1332,8 +1406,8 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	if (type == MBEDTLS_SSL_TRANSPORT_DATAGRAM) {
 		/* DTLS requires timer callbacks to operate */
-		mbedtls_ssl_set_timer_cb(&context->ssl,
-					 &context->dtls_timing,
+		mbedtls_ssl_set_timer_cb(&context->active_session->ssl,
+					 &context->active_session->dtls_timing,
 					 dtls_timing_set_delay,
 					 dtls_timing_get_delay);
 		mbedtls_ssl_conf_handshake_timeout(&context->config,
@@ -1379,7 +1453,7 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 	 * depend on user configuration.
 	 */
 	if (!is_server && !context->options.is_hostname_set) {
-		mbedtls_ssl_set_hostname(&context->ssl, "");
+		mbedtls_ssl_set_hostname(&context->active_session->ssl, "");
 	}
 #endif
 
@@ -1437,7 +1511,7 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 	}
 #endif /* CONFIG_NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK */
 
-	ret = mbedtls_ssl_setup(&context->ssl,
+	ret = mbedtls_ssl_setup(&context->active_session->ssl,
 				&context->config);
 	if (ret != 0) {
 		/* According to mbedTLS API documentation,
@@ -1449,7 +1523,7 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS) && defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
 	if (type == MBEDTLS_SSL_TRANSPORT_DATAGRAM) {
 		if (context->options.dtls_cid.enabled) {
-			ret = mbedtls_ssl_set_cid(&context->ssl, MBEDTLS_SSL_CID_ENABLED,
+			ret = mbedtls_ssl_set_cid(&context->active_session->ssl, MBEDTLS_SSL_CID_ENABLED,
 						  context->options.dtls_cid.cid,
 						  context->options.dtls_cid.cid_len);
 			if (ret != 0) {
@@ -1683,7 +1757,10 @@ static int tls_opt_hostname_set(struct tls_context *context,
 	ARG_UNUSED(optlen);
 
 #if defined(MBEDTLS_X509_CRT_PARSE_C)
-	if (mbedtls_ssl_set_hostname(&context->ssl, optval) != 0) {
+	/* TODO Loop and set for each session? Why doesn't mbed TLS store the
+	 * hostname within config...
+	 */
+	if (mbedtls_ssl_set_hostname(&context->active_session->ssl, optval) != 0) {
 		return -EINVAL;
 	}
 #else
@@ -1764,7 +1841,9 @@ static int tls_opt_ciphersuite_used_get(struct tls_context *context,
 		return -EINVAL;
 	}
 
-	ciph = mbedtls_ssl_get_ciphersuite(&context->ssl);
+	/* TODO This will be problematic for the multi-session case... */
+
+	ciph = mbedtls_ssl_get_ciphersuite(&context->active_session->ssl);
 	if (ciph == NULL) {
 		return -ENOTCONN;
 	}
@@ -1958,7 +2037,8 @@ static int tls_opt_dtls_peer_connection_id_value_get(struct tls_context *context
 		return -ENOTCONN;
 	}
 
-	ret = mbedtls_ssl_get_peer_cid(&context->ssl, &enabled, optval, &optlen_local);
+	/* TODO This will be problematic for the multi-session case... */
+	ret = mbedtls_ssl_get_peer_cid(&context->active_session->ssl, &enabled, optval, &optlen_local);
 	if (enabled) {
 		*optlen = optlen_local;
 	} else {
@@ -1981,6 +2061,8 @@ static int tls_opt_dtls_connection_id_status_get(struct tls_context *context,
 	bool have_self_cid;
 	bool have_peer_cid;
 
+	/* TODO This will be problematic for the multi-session case. */
+
 	if (sizeof(int) != *optlen) {
 		return -EINVAL;
 	}
@@ -1989,7 +2071,7 @@ static int tls_opt_dtls_connection_id_status_get(struct tls_context *context,
 		return -ENOTCONN;
 	}
 
-	ret = mbedtls_ssl_get_peer_cid(&context->ssl, &enabled,
+	ret = mbedtls_ssl_get_peer_cid(&context->active_session->ssl, &enabled,
 				       cid.cid,
 				       &cid.cid_len);
 	if (ret) {
@@ -2123,7 +2205,11 @@ static int tls_opt_cert_verify_result_get(struct tls_context *context,
 		return -EINVAL;
 	}
 
-	*(uint32_t *)optval = mbedtls_ssl_get_verify_result(&context->ssl);
+	/* TODO This will be problematic for the multi-session case.
+	 * Need to timestamp sessions?
+	 */
+
+	*(uint32_t *)optval = mbedtls_ssl_get_verify_result(&context->active_session->ssl);
 
 	return 0;
 }
@@ -2334,7 +2420,8 @@ int ztls_close_ctx(struct tls_context *ctx, int sock)
 	/* Try to send close notification. */
 	ctx->flags = 0;
 
-	(void)mbedtls_ssl_close_notify(&ctx->ssl);
+	/* TODO Loop over all active sessions? */
+	(void)mbedtls_ssl_close_notify(&ctx->active_session->ssl);
 
 	err = tls_release(ctx);
 	ret = zsock_close(ctx->sock);
@@ -2384,7 +2471,7 @@ int ztls_connect_ctx(struct tls_context *ctx, const struct sockaddr *addr,
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	if (ctx->type == SOCK_DGRAM) {
-		dtls_peer_address_set(ctx, addr, addrlen);
+		dtls_peer_address_set(ctx->active_session, addr, addrlen);
 	}
 #endif
 
@@ -2496,6 +2583,7 @@ error:
 static ssize_t send_tls(struct tls_context *ctx, const void *buf,
 			size_t len, int flags)
 {
+	/* TODO This needs to accept session as an arugument... */
 	const bool is_block = is_blocking(ctx->sock, flags);
 	k_timeout_t timeout;
 	k_timepoint_t end;
@@ -2506,7 +2594,7 @@ static ssize_t send_tls(struct tls_context *ctx, const void *buf,
 		return -1;
 	}
 
-	if (ctx->session_closed) {
+	if (ctx->active_session->session_closed) {
 		errno = ECONNABORTED;
 		return -1;
 	}
@@ -2520,7 +2608,7 @@ static ssize_t send_tls(struct tls_context *ctx, const void *buf,
 	end = sys_timepoint_calc(timeout);
 
 	do {
-		ret = mbedtls_ssl_write(&ctx->ssl, buf, len);
+		ret = mbedtls_ssl_write(&ctx->active_session->ssl, buf, len);
 		if (ret >= 0) {
 			return ret;
 		}
@@ -2584,14 +2672,14 @@ static ssize_t sendto_dtls_client(struct tls_context *ctx, const void *buf,
 		/* No address provided, check if we have stored one,
 		 * otherwise return error.
 		 */
-		if (ctx->dtls_peer_addrlen == 0) {
+		if (ctx->active_session->dtls_peer_addrlen == 0) {
 			ret = -EDESTADDRREQ;
 			goto error;
 		}
-	} else if (ctx->dtls_peer_addrlen == 0) {
+	} else if (ctx->active_session->dtls_peer_addrlen == 0) {
 		/* Address provided and no peer address stored. */
-		dtls_peer_address_set(ctx, dest_addr, addrlen);
-	} else if (!dtls_is_peer_addr_valid(ctx, dest_addr, addrlen) != 0) {
+		dtls_peer_address_set(ctx->active_session, dest_addr, addrlen);
+	} else if (!dtls_is_peer_addr_valid(ctx->active_session, dest_addr, addrlen) != 0) {
 		/* Address provided but it does not match stored one */
 		ret = -EISCONN;
 		goto error;
@@ -2604,9 +2692,9 @@ static ssize_t sendto_dtls_client(struct tls_context *ctx, const void *buf,
 		}
 	}
 
-	if (!is_handshake_complete(ctx)) {
-		tls_session_restore(ctx, &ctx->dtls_peer_addr,
-				    ctx->dtls_peer_addrlen);
+	if (!is_handshake_complete(ctx->active_session)) {
+		tls_session_restore(ctx, &ctx->active_session->dtls_peer_addr,
+				    ctx->active_session->dtls_peer_addrlen);
 
 		/* TODO For simplicity, TLS handshake blocks the socket even for
 		 * non-blocking socket.
@@ -2622,8 +2710,8 @@ static ssize_t sendto_dtls_client(struct tls_context *ctx, const void *buf,
 		/* Client socket ready to use again. */
 		ctx->error = 0;
 
-		tls_session_store(ctx, &ctx->dtls_peer_addr,
-				  ctx->dtls_peer_addrlen);
+		tls_session_store(ctx, &ctx->active_session->dtls_peer_addr,
+				  ctx->active_session->dtls_peer_addrlen);
 	}
 
 	return send_tls(ctx, buf, len, flags);
@@ -2638,17 +2726,20 @@ static ssize_t sendto_dtls_server(struct tls_context *ctx, const void *buf,
 				  const struct sockaddr *dest_addr,
 				  socklen_t addrlen)
 {
+	/* TODO This needs an overall rework, as we need to choose the session
+	 * based on peer address.
+	 */
 	/* For DTLS server, require to have established DTLS connection
 	 * in order to send data.
 	 */
-	if (!is_handshake_complete(ctx)) {
+	if (!is_handshake_complete(ctx->active_session)) {
 		errno = ENOTCONN;
 		return -1;
 	}
 
 	/* Verify we are sending to a peer that we have connection with. */
 	if (dest_addr &&
-	    !dtls_is_peer_addr_valid(ctx, dest_addr, addrlen) != 0) {
+	    !dtls_is_peer_addr_valid(ctx->active_session, dest_addr, addrlen) != 0) {
 		errno = EISCONN;
 		return -1;
 	}
@@ -2800,7 +2891,7 @@ static ssize_t recv_tls(struct tls_context *ctx, void *buf,
 		return -1;
 	}
 
-	if (ctx->session_closed) {
+	if (ctx->active_session->session_closed) {
 		return 0;
 	}
 
@@ -2815,14 +2906,14 @@ static ssize_t recv_tls(struct tls_context *ctx, void *buf,
 	do {
 		size_t read_len = max_len - recv_len;
 
-		ret = mbedtls_ssl_read(&ctx->ssl, (uint8_t *)buf + recv_len,
+		ret = mbedtls_ssl_read(&ctx->active_session->ssl, (uint8_t *)buf + recv_len,
 				       read_len);
 		if (ret < 0) {
 			if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
 				/* Peer notified that it's closing the
 				 * connection.
 				 */
-				ctx->session_closed = true;
+				ctx->active_session->session_closed = true;
 				break;
 			}
 
@@ -2831,7 +2922,7 @@ static ssize_t recv_tls(struct tls_context *ctx, void *buf,
 				 * supported. See mbedtls_ssl_read API
 				 * documentation.
 				 */
-				ctx->session_closed = true;
+				ctx->active_session->session_closed = true;
 				break;
 			}
 
@@ -2912,7 +3003,9 @@ static ssize_t recvfrom_dtls_common(struct tls_context *ctx, void *buf,
 	do {
 		size_t remaining;
 
-		ret = mbedtls_ssl_read(&ctx->ssl, buf, max_len);
+		/* TODO Ok this will be tricky. How do I know which session to read from? */
+
+		ret = mbedtls_ssl_read(&ctx->active_session->ssl, buf, max_len);
 		if (ret < 0) {
 			if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
 			    ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
@@ -2930,7 +3023,7 @@ static ssize_t recvfrom_dtls_common(struct tls_context *ctx, void *buf,
 					return ret;
 				}
 
-				timeout_dtls = dtls_get_remaining_timeout(ctx);
+				timeout_dtls = dtls_get_remaining_timeout(ctx->active_session);
 				timeout_sock = timeout_to_ms(&timeout);
 				if (timeout_dtls == SYS_FOREVER_MS ||
 				    timeout_sock == SYS_FOREVER_MS) {
@@ -2956,13 +3049,13 @@ static ssize_t recvfrom_dtls_common(struct tls_context *ctx, void *buf,
 		}
 
 		if (src_addr && addrlen) {
-			dtls_peer_address_get(ctx, src_addr, addrlen);
+			dtls_peer_address_get(ctx->active_session, src_addr, addrlen);
 		}
 
 		/* mbedtls_ssl_get_bytes_avail() indicate the data length
 		 * remaining in the current datagram.
 		 */
-		remaining = mbedtls_ssl_get_bytes_avail(&ctx->ssl);
+		remaining = mbedtls_ssl_get_bytes_avail(&ctx->active_session->ssl);
 
 		/* No more data in the datagram, or dummy read. */
 		if ((remaining == 0) || (max_len == 0)) {
@@ -2977,7 +3070,7 @@ static ssize_t recvfrom_dtls_common(struct tls_context *ctx, void *buf,
 			uint8_t byte;
 			int err;
 
-			err = mbedtls_ssl_read(&ctx->ssl, &byte, sizeof(byte));
+			err = mbedtls_ssl_read(&ctx->active_session->ssl, &byte, sizeof(byte));
 			if (err <= 0) {
 				NET_ERR("Error while flushing the rest of the"
 					" datagram, err %d", err);
@@ -3000,7 +3093,7 @@ static ssize_t recvfrom_dtls_client(struct tls_context *ctx, void *buf,
 {
 	int ret;
 
-	if (!is_handshake_complete(ctx)) {
+	if (!is_handshake_complete(ctx->active_session)) {
 		ret = -ENOTCONN;
 		goto error;
 	}
@@ -3024,7 +3117,7 @@ static ssize_t recvfrom_dtls_client(struct tls_context *ctx, void *buf,
 		break;
 
 	case MBEDTLS_ERR_SSL_TIMEOUT:
-		(void)mbedtls_ssl_close_notify(&ctx->ssl);
+		(void)mbedtls_ssl_close_notify(&ctx->active_session->ssl);
 		ctx->error = ETIMEDOUT;
 		ret = -ETIMEDOUT;
 		break;
@@ -3081,13 +3174,14 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 		timeout = K_NO_WAIT;
 	}
 
+	/* TODO Investigate what's needed for multi-session support */
 	/* Loop to enable DTLS reconnection for servers without closing
 	 * a socket.
 	 */
 	do {
 		repeat = false;
 
-		if (!is_handshake_complete(ctx)) {
+		if (!is_handshake_complete(ctx->active_session)) {
 			ret = tls_mbedtls_handshake(ctx, timeout);
 			if (ret < 0) {
 				/* In case of EAGAIN, just exit. */
@@ -3117,7 +3211,7 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 
 		switch (ret) {
 		case MBEDTLS_ERR_SSL_TIMEOUT:
-			(void)mbedtls_ssl_close_notify(&ctx->ssl);
+			(void)mbedtls_ssl_close_notify(&ctx->active_session->ssl);
 			__fallthrough;
 			/* fallthrough */
 
@@ -3197,12 +3291,14 @@ ssize_t ztls_recvfrom_ctx(struct tls_context *ctx, void *buf, size_t max_len,
 
 static int ztls_poll_prepare_pollin(struct tls_context *ctx)
 {
+	/* TODO loop over contexts... */
+
 	/* If there already is mbedTLS data to read, there is no
 	 * need to set the k_poll_event object. Return EALREADY
 	 * so we won't block in the k_poll.
 	 */
 	if (!ctx->is_listening) {
-		if (mbedtls_ssl_get_bytes_avail(&ctx->ssl) > 0) {
+		if (mbedtls_ssl_get_bytes_avail(&ctx->active_session->ssl) > 0) {
 			return -EALREADY;
 		}
 	}
@@ -3226,8 +3322,8 @@ static int ztls_poll_prepare_ctx(struct tls_context *ctx,
 	 */
 	if ((pfd->events & ZSOCK_POLLIN) && (ctx->type == SOCK_DGRAM) &&
 	    (ctx->options.role == MBEDTLS_SSL_IS_CLIENT) &&
-	    !is_handshake_complete(ctx)) {
-		(*pev)->obj = &ctx->tls_established;
+	    !is_handshake_complete(ctx->active_session)) {
+		(*pev)->obj = &ctx->active_session->tls_established;
 		(*pev)->type = K_POLL_TYPE_SEM_AVAILABLE;
 		(*pev)->mode = K_POLL_MODE_NOTIFY_ONLY;
 		(*pev)->state = K_POLL_STATE_NOT_READY;
@@ -3289,7 +3385,7 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 			}
 		}
 
-		if (!is_handshake_complete(ctx)) {
+		if (!is_handshake_complete(ctx->active_session)) {
 			ret = tls_mbedtls_handshake(ctx, K_NO_WAIT);
 			if (ret < 0) {
 				if (ret == -EAGAIN) {
@@ -3314,7 +3410,7 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 
 	ctx->flags = ZSOCK_MSG_DONTWAIT;
 
-	ret = mbedtls_ssl_read(&ctx->ssl, NULL, 0);
+	ret = mbedtls_ssl_read(&ctx->active_session->ssl, NULL, 0);
 	if (ret < 0) {
 		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
 			/* Don't reset the context for STREAM socket - the
@@ -3328,7 +3424,7 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 					return -ENOMEM;
 				}
 			} else {
-				ctx->session_closed = true;
+				ctx->active_session->session_closed = true;
 			}
 
 			return -ENOTCONN;
@@ -3357,7 +3453,7 @@ static int ztls_socket_data_check(struct tls_context *ctx)
 		return -ECONNABORTED;
 	}
 
-	return mbedtls_ssl_get_bytes_avail(&ctx->ssl);
+	return mbedtls_ssl_get_bytes_avail(&ctx->active_session->ssl);
 }
 
 static int ztls_poll_update_pollin(int fd, struct tls_context *ctx,
@@ -3365,9 +3461,10 @@ static int ztls_poll_update_pollin(int fd, struct tls_context *ctx,
 {
 	int ret;
 
+	/* TODO Loop over sessions to check avaialable data? */
 	if (!ctx->is_listening) {
 		/* Already had TLS data to read on socket. */
-		if (mbedtls_ssl_get_bytes_avail(&ctx->ssl) > 0) {
+		if (mbedtls_ssl_get_bytes_avail(&ctx->active_session->ssl) > 0) {
 			pfd->revents |= ZSOCK_POLLIN;
 			goto next;
 		}
@@ -3388,7 +3485,7 @@ static int ztls_poll_update_pollin(int fd, struct tls_context *ctx,
 		/* Perform data check without incoming data for completed DTLS connections.
 		 * This allows the connections to timeout with CONFIG_NET_SOCKETS_DTLS_TIMEOUT.
 		 */
-		if (!is_handshake_complete(ctx) && !(pfd->revents & ZSOCK_POLLIN)) {
+		if (!is_handshake_complete(ctx->active_session) && !(pfd->revents & ZSOCK_POLLIN)) {
 			goto next;
 		}
 	}
@@ -3444,7 +3541,7 @@ static int ztls_poll_update_ctx(struct tls_context *ctx,
 
 	/* Check if the socket was waiting for the handshake to complete. */
 	if ((pfd->events & ZSOCK_POLLIN) &&
-	    ((*pev)->obj == &ctx->tls_established)) {
+	    ((*pev)->obj == &ctx->active_session->tls_established)) {
 		/* In case handshake is complete, reconfigure the k_poll_event
 		 * to monitor the underlying socket now.
 		 */
@@ -3508,7 +3605,7 @@ static bool poll_offload_dtls_client_retry(struct tls_context *ctx,
 		return false;
 	}
 
-	if (ctx->handshake_in_progress) {
+	if (ctx->active_session->handshake_in_progress) {
 		/* Add some sleep to allow lower priority threads to proceed
 		 * with handshake.
 		 */
@@ -3516,7 +3613,7 @@ static bool poll_offload_dtls_client_retry(struct tls_context *ctx,
 
 		pfd->revents &= ~ZSOCK_POLLIN;
 		return true;
-	} else if (!is_handshake_complete(ctx)) {
+	} else if (!is_handshake_complete(ctx->active_session)) {
 		uint8_t byte;
 		int ret;
 
@@ -3898,8 +3995,14 @@ mbedtls_ssl_context *ztls_get_mbedtls_ssl_context(int fd)
 		return NULL;
 	}
 
-	return &ctx->ssl;
+	return &ctx->active_session->ssl;
 }
+
+uint32_t ztls_get_session_count(void)
+{
+	return k_mem_slab_num_used_get(&tls_session_contexts);
+}
+
 #endif /* CONFIG_NET_TEST */
 
 static ssize_t tls_sock_read_vmeth(void *obj, void *buffer, size_t count)
