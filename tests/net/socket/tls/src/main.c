@@ -28,6 +28,7 @@ uint32_t ztls_get_session_count(void);
 #define SERVER_PORT 4242
 #define CLIENT_1_PORT 4243
 #define CLIENT_2_PORT 4244
+#define CLIENT_3_PORT 4245
 
 #define PSK_TAG 1
 
@@ -1950,7 +1951,7 @@ static void dtls_verify_address(struct sockaddr *addr, socklen_t addrlen,
 	}
 }
 
-static void test_dtls_server_mutli_client_preapre_socks(sa_family_t family,
+static void test_dtls_server_multi_client_prepare_socks(sa_family_t family,
 							struct sockaddr *s_saddr,
 							struct sockaddr *c_saddr_1,
 							struct sockaddr *c_saddr_2)
@@ -2020,7 +2021,7 @@ static void test_dtls_server_multi_client_hs_in_poll(sa_family_t family)
 	uint8_t rx_buf;
 	int ret;
 
-	test_dtls_server_mutli_client_preapre_socks(family, &s_saddr, &c_saddr_1,
+	test_dtls_server_multi_client_prepare_socks(family, &s_saddr, &c_saddr_1,
 						    &c_saddr_2);
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
@@ -2171,7 +2172,7 @@ static void test_dtls_server_multi_client_hs_in_recvfrom(sa_family_t family)
 	uint8_t rx_buf;
 	int ret;
 
-	test_dtls_server_mutli_client_preapre_socks(family, &s_saddr, &c_saddr_1,
+	test_dtls_server_multi_client_prepare_socks(family, &s_saddr, &c_saddr_1,
 						    &c_saddr_2);
 	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
 
@@ -2279,7 +2280,7 @@ ZTEST(net_socket_tls, test_v6_dtls_server_multi_client_hs_in_recvfrom)
 	test_dtls_server_multi_client_hs_in_recvfrom(AF_INET6);
 }
 
-static void test_dtls_server_mutli_client_preapre_two_connections(
+static void test_dtls_server_multi_client_prepare_two_connections(
 	sa_family_t family, struct sockaddr *s_saddr,
 	struct sockaddr *c_saddr_1, struct sockaddr *c_saddr_2)
 {
@@ -2287,7 +2288,7 @@ static void test_dtls_server_mutli_client_preapre_two_connections(
 	uint8_t rx_buf;
 	int ret;
 
-	test_dtls_server_mutli_client_preapre_socks(family, s_saddr, c_saddr_1,
+	test_dtls_server_multi_client_prepare_socks(family, s_saddr, c_saddr_1,
 						    c_saddr_2);
 	/* Client 1 handshake */
 	test_data.sock = c_sock;
@@ -2324,7 +2325,7 @@ static void test_dtls_server_multi_client_sendto(sa_family_t family)
 	uint8_t rx_buf;
 	int ret;
 
-	test_dtls_server_mutli_client_preapre_two_connections(family, &s_saddr,
+	test_dtls_server_multi_client_prepare_two_connections(family, &s_saddr,
 							      &c_saddr_1, &c_saddr_2);
 	zassert_equal(ztls_get_session_count(), 4, "Expected session count mismatch");
 
@@ -2401,6 +2402,175 @@ ZTEST(net_socket_tls, test_v4_dtls_server_multi_client_sendto)
 ZTEST(net_socket_tls, test_v6_dtls_server_multi_client_sendto)
 {
 	test_dtls_server_multi_client_sendto(AF_INET6);
+}
+
+static void test_dtls_server_cid_matching_on_addr_change(sa_family_t family)
+{
+	struct sockaddr c_saddr_1;
+	struct sockaddr c_saddr_2;
+	struct sockaddr c_saddr_1_backup;
+	struct sockaddr s_saddr;
+	struct sockaddr recv_addr;
+	socklen_t recv_addrlen;
+	struct connect_data test_data;
+	uint8_t tx_buf = 0;
+	uint8_t rx_buf;
+	int cid, ret;
+
+	if (!IS_ENABLED(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)) {
+		ztest_test_skip();
+	}
+
+	test_dtls_server_multi_client_prepare_socks(family, &s_saddr, &c_saddr_1,
+						    &c_saddr_2);
+	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
+
+	/* Enable DTLS CID for clients */
+	cid = TLS_DTLS_CID_ENABLED;
+	zassert_ok(zsock_setsockopt(c_sock, SOL_TLS, TLS_DTLS_CID, &cid, sizeof(cid)),
+		   "setsockopt failed (%d)", errno);
+	zassert_ok(zsock_setsockopt(c_sock_2, SOL_TLS, TLS_DTLS_CID, &cid, sizeof(cid)),
+		   "setsockopt failed (%d)", errno);
+
+	/* And enable CID processing for server */
+	cid = TLS_DTLS_CID_SUPPORTED;
+	zassert_ok(zsock_setsockopt(s_sock, SOL_TLS, TLS_DTLS_CID, &cid, sizeof(cid)),
+		   "setsockopt failed (%d)", errno);
+
+	/* Client 1 handshake */
+	test_data.sock = c_sock;
+	test_data.addr = &s_saddr;
+	k_work_init_delayable(&test_data.work, dtls_client_connect_send_work_handler);
+	test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	/* Block in recv for the handshake to complete. */
+	recv_addrlen = sizeof(recv_addr);
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+			     &recv_addr, &recv_addrlen);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+	dtls_verify_address(&recv_addr, recv_addrlen, &c_saddr_1);
+	zassert_equal(ztls_get_session_count(), 3,
+		      "Server shouldn't have allocated extra session");
+
+	c_saddr_1_backup = c_saddr_1;
+	/* Rebind the client socket to a different port */
+	if (family == AF_INET) {
+		net_sin(&c_saddr_1)->sin_port = htons(CLIENT_3_PORT);
+		test_bind(c_sock, &c_saddr_1, sizeof(struct sockaddr_in));
+	} else {
+		net_sin6(&c_saddr_1)->sin6_port = htons(CLIENT_3_PORT);
+		test_bind(c_sock, &c_saddr_1, sizeof(struct sockaddr_in6));
+	}
+
+	/* After rebinding, try to send some data to the server. */
+	test_send(c_sock, &tx_buf, sizeof(tx_buf), 0);
+
+	/* And verify the server receives the data with correct address */
+	recv_addrlen = sizeof(recv_addr);
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+			     &recv_addr, &recv_addrlen);
+	zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+	dtls_verify_address(&recv_addr, recv_addrlen, &c_saddr_1);
+
+	/* No new session should've been spawned */
+	zassert_equal(ztls_get_session_count(), 3,
+		      "Server shouldn't have allocated extra session");
+
+	/* Sending back with the old address should fail */
+
+	/* But new one succeed */
+
+	/* New client connecting with the "old" address but different CID */
+
+	/* New session should be spawned */
+
+	// /* Client 2 handshake */
+	// test_data.sock = c_sock_2;
+	// test_data.addr = &s_saddr;
+	// k_work_init_delayable(&test_data.work, dtls_client_connect_send_no_assert_work_handler);
+	// test_work_reschedule(&test_data.work, K_NO_WAIT);
+
+	// /* Block in recv for the second handshake to complete. */
+	// recv_addrlen = sizeof(recv_addr);
+	// ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+	// 		     &recv_addr, &recv_addrlen);
+	// zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+	// dtls_verify_address(&recv_addr, recv_addrlen, &c_saddr_2);
+	// zassert_equal(ztls_get_session_count(), 4, "Server should've allocated extra session");
+
+	// /* Now as two sessions are established, send data from client 1 again. */
+	// test_send(c_sock, &tx_buf, sizeof(tx_buf), 0);
+
+	// /* And verify the server receives the data with correct address */
+	// recv_addrlen = sizeof(recv_addr);
+	// ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+	// 		     &recv_addr, &recv_addrlen);
+	// zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+	// dtls_verify_address(&recv_addr, recv_addrlen, &c_saddr_1);
+
+	// /* Repeat for client 2 again */
+	// test_send(c_sock_2, &tx_buf, sizeof(tx_buf), 0);
+
+	// /* And verify the server receives the data with correct address */
+	// recv_addrlen = sizeof(recv_addr);
+	// ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+	// 		     &recv_addr, &recv_addrlen);
+	// zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+	// dtls_verify_address(&recv_addr, recv_addrlen, &c_saddr_2);
+
+	// /* Close the second client session */
+	// test_close(c_sock_2);
+	// c_sock_2 = -1;
+
+	// /* Small delay for the alerts exchange */
+	// k_msleep(10);
+
+	// /* Let the server update sessions. */
+	// ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	// zassert_equal(ret, -1, "recv() should've reported EAGAIN");
+	// zassert_equal(errno, EAGAIN, "wrong errno value");
+
+	// /* Two sessions should've been released (one for client, one for server)
+	//  * and the server should still be able to receive data from the second client.
+	//  */
+	// zassert_equal(ztls_get_session_count(), 2, "Expected session count mismatch");
+
+	// test_send(c_sock, &tx_buf, sizeof(tx_buf), 0);
+
+	// recv_addrlen = sizeof(recv_addr);
+	// ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0,
+	// 		     &recv_addr, &recv_addrlen);
+	// zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+	// dtls_verify_address(&recv_addr, recv_addrlen, &c_saddr_1);
+
+	// /* Close the first client session. */
+	// test_close(c_sock);
+	// c_sock = -1;
+
+	// /* Small delay for the alerts exchange */
+	// k_msleep(10);
+
+	// /* Let the server update sessions. */
+	// ret = zsock_recv(s_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	// zassert_equal(ret, -1, "recv() should've reported EAGAIN");
+	// zassert_equal(errno, EAGAIN, "wrong errno value");
+
+	// /* One session should be released (client), server socket needs at least
+	//  * one DTLS session to work with (even disconnected one).
+	//  */
+	// zassert_equal(ztls_get_session_count(), 1, "Expected session count mismatch");
+
+	test_work_wait(&test_data.work);
+}
+
+ZTEST(net_socket_tls, test_v4_dtls_server_cid_matching_on_addr_change)
+{
+	test_dtls_server_cid_matching_on_addr_change(AF_INET);
+}
+
+ZTEST(net_socket_tls, test_v6_dtls_server_cid_matching_on_addr_change)
+{
+	test_dtls_server_cid_matching_on_addr_change(AF_INET6);
 }
 
 static void *tls_tests_setup(void)
