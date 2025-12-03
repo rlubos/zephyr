@@ -2282,7 +2282,8 @@ ZTEST(net_socket_tls, test_v6_dtls_server_multi_client_hs_in_recvfrom)
 
 static void test_dtls_server_multi_client_prepare_two_connections(
 	net_sa_family_t family, struct net_sockaddr *s_saddr,
-	struct net_sockaddr *c_saddr_1, struct net_sockaddr *c_saddr_2)
+	struct net_sockaddr *c_saddr_1, struct net_sockaddr *c_saddr_2,
+	int32_t delay)
 {
 	struct connect_data test_data;
 	uint8_t rx_buf;
@@ -2299,6 +2300,10 @@ static void test_dtls_server_multi_client_prepare_two_connections(
 	/* Block in recv for the handshake to complete. */
 	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0, NULL, NULL);
 	zassert_equal(ret, sizeof(rx_buf), "recv() failed");
+
+	if (delay > 0) {
+		k_msleep(delay);
+	}
 
 	/* Client 2 handshake */
 	test_data.sock = c_sock_2;
@@ -2326,7 +2331,7 @@ static void test_dtls_server_multi_client_sendto(net_sa_family_t family)
 	int ret;
 
 	test_dtls_server_multi_client_prepare_two_connections(family, &s_saddr,
-							      &c_saddr_1, &c_saddr_2);
+							      &c_saddr_1, &c_saddr_2, 0);
 	zassert_equal(ztls_get_session_count(), 4, "Expected session count mismatch");
 
 	/* As two sessions are established, send data from server to client 1. */
@@ -2560,6 +2565,134 @@ ZTEST(net_socket_tls, test_v4_dtls_server_cid_matching_on_addr_change)
 ZTEST(net_socket_tls, test_v6_dtls_server_cid_matching_on_addr_change)
 {
 	test_dtls_server_cid_matching_on_addr_change(NET_AF_INET6);
+}
+
+static void test_dtls_server_session_timeout_poll(net_sa_family_t family)
+{
+	struct net_sockaddr c_saddr_1;
+	struct net_sockaddr c_saddr_2;
+	struct net_sockaddr s_saddr;
+	int32_t delay = CONFIG_NET_SOCKETS_DTLS_TIMEOUT / 2 + 100;
+	struct zsock_pollfd fds[1];
+	uint8_t rx_buf;
+	int ret;
+
+	test_dtls_server_multi_client_prepare_two_connections(
+		family, &s_saddr, &c_saddr_1, &c_saddr_2, delay);
+	zassert_equal(ztls_get_session_count(), 4, "Expected session count mismatch");
+
+	/* First client session should time out */
+	fds[0].fd = s_sock;
+	fds[0].events = ZSOCK_POLLIN;
+	ret = zsock_poll(fds, 1, delay);
+	zassert_equal(ret, 1, "poll() did not report data ready");
+	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "expected ZSOCK_POLLHUP");
+	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
+
+	/* Small delay for the alerts exchange */
+	k_msleep(10);
+
+	/* Verify client socket reports error (server closed the session) */
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should've failed");
+	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
+
+	/* Second client should still be operational */
+	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Not really an error (EAGAIN) */
+	zassert_equal(ret, -1, "recv() should've failed");
+	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
+
+	/* Second client session should time out */
+	fds[0].fd = s_sock;
+	fds[0].events = ZSOCK_POLLIN;
+	ret = zsock_poll(fds, 1, delay);
+	zassert_equal(ret, 1, "poll() did not report data ready");
+	zassert_equal(fds[0].revents, ZSOCK_POLLHUP, "expected ZSOCK_POLLHUP");
+	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
+
+	/* Small delay for the alerts exchange */
+	k_msleep(10);
+
+	/* Verify second client socket reports error (server closed the session) */
+	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should've failed");
+	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
+}
+
+ZTEST(net_socket_tls, test_v4_dtls_server_session_timeout_poll)
+{
+	test_dtls_server_session_timeout_poll(NET_AF_INET);
+}
+
+ZTEST(net_socket_tls, test_v6_dtls_server_session_timeout_poll)
+{
+	test_dtls_server_session_timeout_poll(NET_AF_INET6);
+}
+
+static void test_dtls_server_session_timeout_recvfrom(net_sa_family_t family)
+{
+	struct net_sockaddr c_saddr_1;
+	struct net_sockaddr c_saddr_2;
+	struct net_sockaddr s_saddr;
+	int32_t delay = CONFIG_NET_SOCKETS_DTLS_TIMEOUT / 2 + 100;
+	struct timeval timeo_optval;
+	uint8_t rx_buf;
+	int ret;
+
+	timeo_optval.tv_sec = 0;
+	timeo_optval.tv_usec = delay * USEC_PER_MSEC;
+
+	test_dtls_server_multi_client_prepare_two_connections(
+		family, &s_saddr, &c_saddr_1, &c_saddr_2, delay);
+	zassert_equal(ztls_get_session_count(), 4, "Expected session count mismatch");
+
+	zassert_ok(zsock_setsockopt(s_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO,
+				    &timeo_optval, sizeof(timeo_optval)),
+		   "setsockopt failed (%d)", errno);
+
+	/* Block in recv, it should timeout, and the first client should've timed
+	 * out at this point.
+	 */
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0, NULL, NULL);
+	zassert_equal(ret, -1, "recv() should've timed out");
+	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
+	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
+
+	/* Small delay for the alerts exchange */
+	k_msleep(10);
+
+	/* Verify client socket reports error (server closed the session) */
+	ret = zsock_recv(c_sock, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should've failed");
+	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
+
+	/* Second client should still be operational */
+	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	/* Not really an error (EAGAIN) */
+	zassert_equal(ret, -1, "recv() should've failed");
+	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
+
+	/* Second client session should time out */
+	ret = zsock_recvfrom(s_sock, &rx_buf, sizeof(rx_buf), 0, NULL, NULL);
+	zassert_equal(ret, -1, "recv() should've timed out");
+	zassert_equal(errno, EAGAIN, "Wrong errno, expected EAGAIN");
+	zassert_equal(ztls_get_session_count(), 3, "Expected session count mismatch");
+
+	/* Verify second client socket reports error (server closed the session) */
+	ret = zsock_recv(c_sock_2, &rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, -1, "recv() should've failed");
+	zassert_equal(errno, ENOTCONN, "Wrong errno, expected ENOTCONN");
+}
+
+ZTEST(net_socket_tls, test_v4_dtls_server_session_timeout_recvfrom)
+{
+	test_dtls_server_session_timeout_recvfrom(NET_AF_INET);
+}
+
+ZTEST(net_socket_tls, test_v6_dtls_server_session_timeout_recvfrom)
+{
+	test_dtls_server_session_timeout_recvfrom(NET_AF_INET6);
 }
 
 static void *tls_tests_setup(void)
