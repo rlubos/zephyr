@@ -151,6 +151,9 @@ struct tls_session_context {
 
 	/* DTLS peer address length. */
 	net_socklen_t dtls_peer_addrlen;
+
+	/* DTLS session expiry time (server only). */
+	k_timepoint_t session_expiry;
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 };
 
@@ -385,6 +388,17 @@ static int dtls_get_remaining_timeout(struct tls_session_context *session_ctx)
 	}
 
 	return timing->fin_ms - elapsed_ms;
+}
+
+static void dtls_server_init_session_timeout(struct tls_session_context *session_ctx)
+{
+	session_ctx->session_expiry = sys_timepoint_calc(K_FOREVER);
+}
+
+static void dtls_server_refresh_session_timeout(struct tls_session_context *session_ctx)
+{
+	session_ctx->session_expiry =
+		sys_timepoint_calc(K_MSEC(CONFIG_NET_SOCKETS_DTLS_TIMEOUT));
 }
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 
@@ -928,6 +942,10 @@ static int dtls_tx(void *ctx, const unsigned char *buf, size_t len)
 	struct tls_context *tls_ctx = ctx;
 	ssize_t sent;
 
+	if (tls_ctx->options.role == MBEDTLS_SSL_IS_SERVER) {
+		dtls_server_refresh_session_timeout(tls_ctx->active_session);
+	}
+
 	sent = zsock_sendto(tls_ctx->sock, buf, len, ZSOCK_MSG_DONTWAIT,
 			    &tls_ctx->active_session->dtls_peer_addr,
 			    tls_ctx->active_session->dtls_peer_addrlen);
@@ -994,6 +1012,8 @@ static int dtls_server_rx(void *ctx, unsigned char *buf, size_t len)
 			 errno);
 		return MBEDTLS_ERR_NET_RECV_FAILED;
 	}
+
+	dtls_server_refresh_session_timeout(tls_ctx->active_session);
 
 	NET_INFO("DTLS server RX: %d bytes from [%s]:%d", received,
 		 addr.sa_family == NET_AF_INET ?
@@ -1135,6 +1155,8 @@ static int dtls_server_new_active_session(struct tls_context *tls_ctx,
 	sys_slist_append(&tls_ctx->sessions, &session_ctx->node);
 	tls_ctx->active_session = session_ctx;
 
+	dtls_server_refresh_session_timeout(session_ctx);
+
 	return 0;
 }
 
@@ -1275,6 +1297,8 @@ static int dtls_server_free_active_session(struct tls_context *tls_ctx)
 {
 	int ret = 0;
 
+	dtls_server_init_session_timeout(tls_ctx->active_session);
+
 	if (sys_slist_len(&tls_ctx->sessions) > 1) {
 		struct tls_session_context *session_ctx;
 
@@ -1293,6 +1317,23 @@ static int dtls_server_free_active_session(struct tls_context *tls_ctx)
 	tls_ctx->error = 0;
 
 	return ret;
+}
+
+static bool dtls_server_check_expired_sessions(struct tls_context *tls_ctx)
+{
+	struct tls_session_context *session_ctx, *next;
+	bool expired = false;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tls_ctx->sessions, session_ctx, next, node) {
+		if (sys_timepoint_expired(session_ctx->session_expiry)) {
+			tls_ctx->active_session = session_ctx;
+			(void)mbedtls_ssl_close_notify(&tls_ctx->active_session->ssl);
+			(void)dtls_server_free_active_session(tls_ctx);
+			expired = true;
+		}
+	}
+
+	return expired;
 }
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 
@@ -1724,6 +1765,9 @@ static int tls_mbedtls_session_init(struct tls_session_context *session_ctx,
 					 &session_ctx->dtls_timing,
 					 dtls_timing_set_delay,
 					 dtls_timing_get_delay);
+
+		dtls_server_init_session_timeout(session_ctx);
+
 #if defined(CONFIG_MBEDTLS_SSL_DTLS_CONNECTION_ID)
 		if (tls_ctx->options.dtls_cid.enabled) {
 			ret = mbedtls_ssl_set_cid(&session_ctx->ssl, MBEDTLS_SSL_CID_ENABLED,
@@ -3550,6 +3594,8 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 
 		repeat = false;
 
+		(void)dtls_server_check_expired_sessions(ctx);
+
 		if (!is_handshake_complete(ctx->active_session)) {
 			ret = tls_mbedtls_handshake(ctx, timeout);
 			if (ret < 0) {
@@ -3617,6 +3663,7 @@ static ssize_t recvfrom_dtls_server(struct tls_context *ctx, void *buf,
 				/* Current peer changed, repeat the loop. */
 				repeat = true;
 			} else {
+				(void)dtls_server_check_expired_sessions(ctx);
 				/* Otherwise, just return the error. */
 				ret = -EAGAIN;
 			}
@@ -3856,6 +3903,10 @@ static int dtls_data_check(struct tls_context *ctx)
 	}
 
 again:
+	if (is_server && dtls_server_check_expired_sessions(ctx)) {
+		return -ENOTCONN;
+	}
+
 	if (!is_handshake_complete(ctx->active_session)) {
 		ret = tls_mbedtls_handshake(ctx, K_NO_WAIT);
 		if (ret < 0) {
@@ -3919,6 +3970,10 @@ again:
 				ret = dtls_server_switch_session_on_rx(ctx);
 				if (ret == 0) {
 					goto again;
+				}
+
+				if (dtls_server_check_expired_sessions(ctx)) {
+					return -ENOTCONN;
 				}
 			}
 
