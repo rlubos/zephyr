@@ -2947,21 +2947,29 @@ static ssize_t sendto_dtls_server(struct tls_context *ctx, const void *buf,
 				  const struct net_sockaddr *dest_addr,
 				  net_socklen_t addrlen)
 {
-	/* TODO This needs an overall rework, as we need to choose the session
-	 * based on peer address.
-	 */
+	int ret;
+
+	if (dest_addr != NULL) {
+		/* Verify we have a session with the client. */
+		ret = dtls_server_switch_active_session(ctx, dest_addr, addrlen);
+		if (ret < 0) {
+			NET_ERR("No session found for [%s]:%d",
+				dest_addr->sa_family == NET_AF_INET ?
+				net_sprint_ipv4_addr(&net_sin(dest_addr)->sin_addr) :
+				net_sprint_ipv6_addr(&net_sin6(dest_addr)->sin6_addr),
+				dest_addr->sa_family == NET_AF_INET ?
+				net_ntohs(net_sin(dest_addr)->sin_port) :
+				net_ntohs(net_sin6(dest_addr)->sin6_port));
+			errno = ENOTCONN;
+			return -1;
+		}
+	}
+
 	/* For DTLS server, require to have established DTLS connection
 	 * in order to send data.
 	 */
 	if (!is_handshake_complete(ctx->active_session)) {
 		errno = ENOTCONN;
-		return -1;
-	}
-
-	/* Verify we are sending to a peer that we have connection with. */
-	if (dest_addr &&
-	    !dtls_is_peer_addr_valid(ctx->active_session, dest_addr, addrlen) != 0) {
-		errno = EISCONN;
 		return -1;
 	}
 
