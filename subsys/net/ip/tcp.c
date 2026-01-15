@@ -929,7 +929,10 @@ void tcp_install_close_cb(struct net_context *ctx,
 
 static int tcp_conn_unref(struct tcp *conn)
 {
-	int ref_count = atomic_get(&conn->ref_count);
+	int ref_count;
+
+	k_mutex_lock(&tcp_lock, K_FOREVER);
+	ref_count = atomic_get(&conn->ref_count);
 
 	NET_DBG("[%p] ref_count=%d", conn, ref_count);
 
@@ -937,6 +940,7 @@ static int tcp_conn_unref(struct tcp *conn)
 	if (ref_count != 0) {
 		tp_out(net_context_get_family(conn->context), conn->iface,
 		       "TP_TRACE", "event", "CONN_DELETE");
+		k_mutex_unlock(&tcp_lock);
 		return ref_count;
 	}
 
@@ -946,6 +950,7 @@ static int tcp_conn_unref(struct tcp *conn)
 	 */
 	k_work_submit_to_queue(&tcp_work_q, &conn->conn_release);
 
+	k_mutex_unlock(&tcp_lock);
 	return ref_count;
 }
 
@@ -2161,9 +2166,13 @@ static void tcp_send_ack(struct k_work *work)
 
 static void tcp_conn_ref(struct tcp *conn)
 {
-	int ref_count = atomic_inc(&conn->ref_count) + 1;
+	int ref_count;
+
+	k_mutex_lock(&tcp_lock, K_FOREVER);
+	ref_count = atomic_inc(&conn->ref_count) + 1;
 
 	NET_DBG("[%p] ref_count: %d", conn, ref_count);
+	k_mutex_unlock(&tcp_lock);
 }
 
 static struct tcp *tcp_conn_alloc(void)
@@ -2333,7 +2342,18 @@ static enum net_verdict tcp_recv(struct net_conn *net_conn,
 	}
 in:
 	if (conn) {
+		k_mutex_lock(&tcp_lock, K_FOREVER);
+		if (atomic_get(&conn->ref_count) == 0) {
+			/* Connection already scheduled for release */
+			k_mutex_unlock(&tcp_lock);
+			goto out;
+		}
+		tcp_conn_ref(conn);
+		k_mutex_unlock(&tcp_lock);
+
 		verdict = tcp_in(conn, pkt);
+
+		tcp_conn_unref(conn);
 	} else {
 		net_tcp_reply_rst(pkt);
 	}
