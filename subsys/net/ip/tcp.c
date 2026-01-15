@@ -913,6 +913,8 @@ static void tcp_conn_release(struct k_work *work)
 	k_mutex_unlock(&tcp_lock);
 
 	k_mem_slab_free(&tcp_conns_slab, (void *)conn);
+
+	NET_DBG("[%p] Connection released", conn);
 }
 
 #if defined(CONFIG_NET_TEST)
@@ -932,10 +934,6 @@ static int tcp_conn_unref(struct tcp *conn)
 	int ref_count;
 
 	k_mutex_lock(&tcp_lock, K_FOREVER);
-	ref_count = atomic_get(&conn->ref_count);
-
-	NET_DBG("[%p] ref_count=%d", conn, ref_count);
-
 	ref_count = atomic_dec(&conn->ref_count) - 1;
 	if (ref_count != 0) {
 		tp_out(net_context_get_family(conn->context), conn->iface,
@@ -964,9 +962,8 @@ static int tcp_conn_close_debug(struct tcp *conn, int status,
 static int tcp_conn_close(struct tcp *conn, int status)
 #endif
 {
-#if CONFIG_NET_TCP_LOG_LEVEL >= LOG_LEVEL_DBG
-	NET_DBG("[%p] closed by TCP stack (%s():%d)", conn, caller, line);
-#endif
+	int ref_count;
+
 	k_mutex_lock(&conn->lock, K_FOREVER);
 	conn_state(conn, TCP_CLOSED);
 	keep_alive_timer_stop(conn);
@@ -989,7 +986,13 @@ static int tcp_conn_close(struct tcp *conn, int status)
 
 	k_sem_give(&conn->tx_sem);
 
-	return tcp_conn_unref(conn);
+	ref_count = tcp_conn_unref(conn);
+#if CONFIG_NET_TCP_LOG_LEVEL >= LOG_LEVEL_DBG
+	NET_DBG("[%p] Connection closed by TCP stack, ref_count=%d (%s():%d)",
+		conn, ref_count, caller, line);
+#endif
+
+	return ref_count;
 }
 
 static void tcp_send_process_no_lock(struct tcp *conn)
@@ -2171,7 +2174,6 @@ static void tcp_conn_ref(struct tcp *conn)
 	k_mutex_lock(&tcp_lock, K_FOREVER);
 	ref_count = atomic_inc(&conn->ref_count) + 1;
 
-	NET_DBG("[%p] ref_count: %d", conn, ref_count);
 	k_mutex_unlock(&tcp_lock);
 }
 
@@ -2237,8 +2239,9 @@ static struct tcp *tcp_conn_alloc(void)
 	k_mutex_lock(&tcp_lock, K_FOREVER);
 	sys_slist_append(&tcp_conns, &conn->next);
 	k_mutex_unlock(&tcp_lock);
+
+	NET_DBG("[%p] Connection allocated", conn);
 out:
-	NET_DBG("[%p] Allocated", conn);
 
 	return conn;
 }
@@ -3148,6 +3151,7 @@ static enum net_verdict tcp_in(struct tcp *conn, struct net_pkt *pkt)
 			k_work_cancel_delayable(&conn->establish_timer);
 			k_work_cancel_delayable(&conn->send_data_timer);
 			tcp_conn_ref(conn);
+			NET_DBG("[%p] Connection ref (SYN received)", conn);
 			net_context_set_state(conn->context,
 					      NET_CONTEXT_CONNECTED);
 
@@ -3714,6 +3718,7 @@ out:
 int net_tcp_put(struct net_context *context, bool force_close)
 {
 	struct tcp *conn = context->tcp;
+	int ref_count;
 
 	if (!conn) {
 		return -ENOENT;
@@ -3773,7 +3778,8 @@ int net_tcp_put(struct net_context *context, bool force_close)
 
 	k_mutex_unlock(&conn->lock);
 
-	tcp_conn_unref(conn);
+	ref_count = tcp_conn_unref(conn);
+	NET_DBG("[%p] Connection closed by app, ref_count=%d", conn, ref_count);
 
 	return 0;
 }
@@ -3944,6 +3950,7 @@ static int tcp_start_handshake(struct tcp *conn)
 	conn_seq(conn, + 1);
 	conn_state(conn, TCP_SYN_SENT);
 	tcp_conn_ref(conn);
+	NET_DBG("[%p] Connection ref (SYN sent)", conn);
 	k_mutex_unlock(&conn->lock);
 
 	return 0;
