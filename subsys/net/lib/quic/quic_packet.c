@@ -557,7 +557,8 @@ static int handle_reset_stream_frame(struct quic_endpoint *ep,
 
 static int quic_send_reset_stream(struct quic_endpoint *ep,
 				  uint64_t stream_id,
-				  uint64_t error_code)
+				  uint64_t error_code,
+				  uint64_t final_size)
 {
 	uint8_t frame[32];
 	int pos = 0;
@@ -577,7 +578,8 @@ static int quic_send_reset_stream(struct quic_endpoint *ep,
 	}
 	pos += n;
 
-	n = quic_put_varint(&frame[pos], sizeof(frame) - pos, 0 /* final_size */);
+	/* The bytes sent on the stream so far (RFC 9000 ch. 4.5) */
+	n = quic_put_varint(&frame[pos], sizeof(frame) - pos, final_size);
 	if (n <= 0) {
 		return -EINVAL;
 	}
@@ -717,11 +719,11 @@ static int handle_stop_sending_frame(struct quic_endpoint *ep,
 
 	if (stream != NULL && stream->tx_reset) {
 		if (quic_reply_budget_take(budget)) {
-			quic_send_reset_stream(ep, stream_id, error_code);
+			quic_send_reset_stream(ep, stream_id, error_code, stream->bytes_sent);
 		}
 	} else if (stream != NULL) {
 		/* Send RESET_STREAM, our TX side is being abandoned */
-		quic_send_reset_stream(ep, stream_id, error_code);
+		quic_send_reset_stream(ep, stream_id, error_code, stream->bytes_sent);
 
 		/* Mark TX side as reset so future sends return an error */
 		stream->tx_reset = true;
