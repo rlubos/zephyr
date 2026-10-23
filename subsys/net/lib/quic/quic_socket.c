@@ -1027,6 +1027,7 @@ static int quic_send_stream_fin(struct quic_stream *stream, struct quic_endpoint
 	enum quic_secret_level level;
 	size_t frame_len = 0;
 	uint64_t sent_pn;
+	bool reset;
 	int ret;
 
 	/* A unidirectional stream that the peer opened is receive-only for
@@ -1034,6 +1035,17 @@ static int quic_send_stream_fin(struct quic_stream *stream, struct quic_endpoint
 	 * finished, and a STREAM frame on it is an error for the peer.
 	 */
 	if ((stream->id & 2U) != 0U && ((stream->id & 1U) != 0U) != ep->is_server) {
+		return 0;
+	}
+
+	/* RESET_STREAM fixed the final size already, and a FIN cannot change
+	 * it (RFC 9000 ch. 4.5)
+	 */
+	k_mutex_lock(&stream->tx_lock, K_FOREVER);
+	reset = stream->tx_reset;
+	k_mutex_unlock(&stream->tx_lock);
+
+	if (reset) {
 		return 0;
 	}
 
@@ -1446,6 +1458,15 @@ static ssize_t quic_stream_send(struct quic_stream *stream, const uint8_t *buf,
 
 	/* Also limit by TX retransmit buffer space */
 	k_mutex_lock(&stream->tx_lock, K_FOREVER);
+
+	/* No data is sent at or beyond the final size of a RESET_STREAM
+	 * (RFC 9000 ch. 4.5)
+	 */
+	if (stream->tx_reset) {
+		k_mutex_unlock(&stream->tx_lock);
+		return -EPIPE;
+	}
+
 	tx = &stream->tx_buf;
 	tx_free = sizeof(tx->data) - tx->len;
 
@@ -1515,9 +1536,16 @@ static ssize_t quic_stream_send(struct quic_stream *stream, const uint8_t *buf,
 	frame_len += to_send;
 
 	/* Copy into retransmit buffer before sending. If the send fails the
-	 * data stays here for PTO / loss detection retransmission.
+	 * data stays here for PTO / loss detection retransmission. A reset
+	 * takes its final size from the end of this buffer, so data is not
+	 * queued once the stream is reset.
 	 */
 	k_mutex_lock(&stream->tx_lock, K_FOREVER);
+	if (stream->tx_reset) {
+		k_mutex_unlock(&stream->tx_lock);
+		return -EPIPE;
+	}
+
 	memcpy(&tx->data[tx->len], buf, to_send);
 	tx->len += to_send;
 	k_mutex_unlock(&stream->tx_lock);
@@ -1525,9 +1553,15 @@ static ssize_t quic_stream_send(struct quic_stream *stream, const uint8_t *buf,
 	/* Send the packet */
 	ret = quic_send_packet_with_pn(ep, level, frame, frame_len, &sent_pn);
 	if (ret < 0) {
-		/* Roll back TX buffer on send failure */
+		/* Roll back TX buffer on send failure. Data that a reset
+		 * has counted in its final size stays counted as sent, as
+		 * the peer counts it in its flow control.
+		 */
 		k_mutex_lock(&stream->tx_lock, K_FOREVER);
-		if (stream->bytes_sent == this_offset) {
+		if (stream->tx_reset) {
+			stream->bytes_sent += to_send;
+			ep->tx_fc.bytes_sent += to_send;
+		} else if (stream->bytes_sent == this_offset) {
 			size_t buf_off = (size_t)(this_offset - tx->base_offset);
 
 			if (buf_off < tx->len && buf_off + to_send <= tx->len) {
