@@ -7046,6 +7046,7 @@ static void link_test_stream(struct quic_stream *stream, struct quic_context *ct
 	k_mutex_init(&stream->cond.data_available);
 	k_condvar_init(&stream->cond.recv);
 	k_poll_signal_init(&stream->recv.signal);
+	k_mutex_init(&stream->tx_lock);
 
 	sys_slist_append(&ctx->streams, &stream->node);
 }
@@ -8263,6 +8264,57 @@ ZTEST(net_socket_quic, test_504_closed_connection_hangs_up_with_streams_waiting)
 	(void)sys_slist_find_and_remove(&ctx->endpoints, &ep->node);
 	ctx->closed = false;
 	ctx->is_listening = true;
+
+	ret = quic_connection_close(sock);
+	zassert_ok(ret, "Cannot close socket %d (%d)", sock, -errno);
+}
+
+ZTEST(net_socket_quic, test_527_reset_stream_final_size_is_fixed)
+{
+	static struct quic_stream stream;
+	struct quic_endpoint *ep = reset_test_ep(&test_ep_a);
+	struct quic_context *ctx;
+	int sock;
+	int ret;
+
+	ctx = open_test_listener(&sock, "127.0.0.1:54372");
+	ep->is_server = true;
+	link_test_stream(&stream, ctx, ep, 0);
+	/* A lookup takes a reference, so the stream needs one of its own */
+	atomic_set(&stream.refcount, 1);
+
+	/* 100 bytes are queued for sending. The send of the last 40 is
+	 * under way and not counted in bytes_sent yet, but the peer can
+	 * get them: the final size must cover them.
+	 */
+	stream.tx_buf.base_offset = 0U;
+	stream.tx_buf.len = 100U;
+	stream.bytes_sent = 60U;
+
+	quic_test_reset_final_size = UINT64_MAX;
+	ret = stop_sending_for_stream(ep, ctx, 0);
+	zassert_true(ret >= 0, "STOP_SENDING handling failed (%d)", ret);
+	zexpect_true(stream.tx_reset, "Stream not reset");
+	zexpect_equal(quic_test_reset_final_size, 100U,
+		      "Final size %" PRIu64 " is not the end of the queued data",
+		      quic_test_reset_final_size);
+
+	/* The send completes and the peer acknowledges part of the data. A
+	 * repeated STOP_SENDING gets the same final size.
+	 */
+	stream.bytes_sent = 100U;
+	stream.tx_buf.base_offset = 60U;
+	stream.tx_buf.len = 40U;
+
+	quic_test_reset_final_size = UINT64_MAX;
+	ret = stop_sending_for_stream(ep, ctx, 0);
+	zassert_true(ret >= 0, "STOP_SENDING handling failed (%d)", ret);
+	zexpect_equal(quic_test_reset_final_size, 100U,
+		      "Final size changed to %" PRIu64 " on a repeated reset",
+		      quic_test_reset_final_size);
+
+	zexpect_equal(atomic_get(&stream.refcount), 1, "Stream reference not given back");
+	unlink_test_stream(&stream, ctx);
 
 	ret = quic_connection_close(sock);
 	zassert_ok(ret, "Cannot close socket %d (%d)", sock, -errno);
