@@ -429,6 +429,22 @@ static int h3_recv_peer_uni_stream_data(struct h3_uni_stream_rx_ctx *rx_ctx, int
 			return 0;
 		}
 
+		/* A critical stream the peer reset is as closed as one it
+		 * ended (RFC 9114 ch. 6.2.1). The same error stands for a
+		 * connection that is gone, which the socket tells apart.
+		 */
+		if (errno == ECONNRESET) {
+			net_socklen_t optlen = sizeof(int);
+			int err = 0;
+
+			if (zsock_getsockopt(fd, ZSOCK_SOL_SOCKET, ZSOCK_SO_ERROR, &err,
+					     &optlen) == 0 && err == 0) {
+				return -H3_CLOSED_CRITICAL_STREAM;
+			}
+
+			return -ECONNRESET;
+		}
+
 		return -errno;
 	}
 
