@@ -40,6 +40,9 @@
 #define H3_UNI_STREAM_CONTROL 0x00
 #define H3_UNI_STREAM_PUSH 0x01
 #define H3_UNI_STREAM_QPACK_ENCODER 0x02
+
+/* HTTP/3 error code (RFC 9114 Section 8.1) */
+#define H3_REQUEST_CANCELLED 0x10c
 #define H3_UNI_STREAM_QPACK_DECODER 0x03
 
 #define QPACK_STATIC_PATH_SLASH 1
@@ -1810,6 +1813,20 @@ static void end_client_stream(int fd)
 	zassert_ok(ret, "Failed to end stream %d (%d)", fd, errno);
 }
 
+/* Abandon a client stream with RESET_STREAM instead of ending it */
+static void reset_client_stream(int fd)
+{
+	uint64_t code = H3_REQUEST_CANCELLED;
+	int ret;
+
+	ret = zsock_setsockopt(fd, ZSOCK_SOL_QUIC, ZSOCK_QUIC_SO_RESET_STREAM_CODE,
+			       &code, sizeof(code));
+	zassert_ok(ret, "Failed to arm a reset on stream %d (%d)", fd, errno);
+
+	ret = zsock_shutdown(fd, ZSOCK_SHUT_WR);
+	zassert_ok(ret, "Failed to reset stream %d (%d)", fd, errno);
+}
+
 ZTEST(server_h3_tests, test_h3_closed_control_stream_closes_connection)
 {
 	static const uint8_t settings[] = { H3_FRAME_SETTINGS, 0x00 };
@@ -1835,6 +1852,35 @@ ZTEST(server_h3_tests, test_h3_closed_qpack_stream_closes_connection)
 	send_get_and_expect_static(false);
 
 	end_client_stream(qpack_fd);
+
+	expect_connection_closed_and_server_alive();
+}
+
+ZTEST(server_h3_tests, test_h3_reset_control_stream_closes_connection)
+{
+	static const uint8_t settings[] = { H3_FRAME_SETTINGS, 0x00 };
+	int control_fd;
+
+	control_fd = start_h3_session_with_control_data(settings, sizeof(settings));
+	send_get_and_expect_static(false);
+
+	reset_client_stream(control_fd);
+
+	expect_connection_closed_and_server_alive();
+}
+
+ZTEST(server_h3_tests, test_h3_reset_qpack_stream_closes_connection)
+{
+	static const uint8_t stream_type[] = { H3_UNI_STREAM_QPACK_ENCODER };
+	int qpack_fd;
+
+	start_h3_session(false);
+
+	qpack_fd = open_client_stream(QUIC_STREAM_UNIDIRECTIONAL);
+	send_all(qpack_fd, stream_type, sizeof(stream_type));
+	send_get_and_expect_static(false);
+
+	reset_client_stream(qpack_fd);
 
 	expect_connection_closed_and_server_alive();
 }
