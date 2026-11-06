@@ -1154,6 +1154,15 @@ static int h3_send_data_frame(struct http_client_ctx *client,
 	return 0;
 }
 
+/* The code the peer is given in STOP_SENDING when the stream is shut down
+ * or closed before it ended it (RFC 9114 ch. 8.1).
+ */
+static void h3_set_stop_sending_code(int fd, uint64_t code)
+{
+	(void)zsock_setsockopt(fd, ZSOCK_SOL_QUIC, ZSOCK_QUIC_SO_STOP_SENDING_CODE, &code,
+			       sizeof(code));
+}
+
 /**
  * Signal end-of-response on the current request stream.
  *
@@ -1170,11 +1179,8 @@ static int h3_end_response(struct http_client_ctx *client)
 	 * erroneously send DATA frames after the HEADERS.
 	 */
 	int ret;
-	uint64_t stop_code = H3_NO_ERROR;
 
-	(void)zsock_setsockopt(client->fd, ZSOCK_SOL_QUIC,
-			       ZSOCK_QUIC_SO_STOP_SENDING_CODE,
-			       &stop_code, sizeof(stop_code));
+	h3_set_stop_sending_code(client->fd, H3_NO_ERROR);
 
 	ret = zsock_shutdown(client->fd, ZSOCK_SHUT_RDWR);
 	if (ret < 0) {
@@ -2731,7 +2737,9 @@ int h3_identify_uni_stream(struct http_client_ctx *client, int fd)
 		return H3_STREAM_IGNORED;
 
 	default:
-		/* Unknown stream types MUST be ignored per RFC 9114 */
+		/* Unknown stream types MUST be ignored per RFC 9114, aborted
+		 * with H3_STREAM_CREATION_ERROR (ch. 6.2).
+		 */
 		LOG_DBG("[%p] H3: Unknown uni stream type 0x%llx", client, stream_type);
 		zsock_close(fd);
 		return H3_STREAM_IGNORED;
@@ -3054,6 +3062,12 @@ static int handle_accepted_stream(struct http_client_ctx *client,
 		LOG_DBG("[%p] H3: Accepted peer unidirectional stream (fd=%d)", client,
 			stream_sock);
 
+		/* The code of a stream rejected before it was taken into use;
+		 * one that is never closed with the connection up afterwards
+		 * keeps it unused.
+		 */
+		h3_set_stop_sending_code(stream_sock, H3_STREAM_CREATION_ERROR);
+
 		if (client == NULL) {
 			/* No client context yet, close and let it reconnect */
 			zsock_close(stream_sock);
@@ -3161,6 +3175,11 @@ int accept_h3_stream(int h3_conn_sock, int *stream_sock)
 			zsock_close(new_socket);
 			return -ENOENT;
 		}
+
+		/* A request stream closed before the request ended is
+		 * cancelled, unless the response says otherwise.
+		 */
+		h3_set_stop_sending_code(new_socket, H3_REQUEST_CANCELLED);
 
 		ret = handle_accepted_stream(client, h3_conn_sock,
 					     new_socket,
