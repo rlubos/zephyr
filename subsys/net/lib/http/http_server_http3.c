@@ -2731,10 +2731,12 @@ int h3_identify_uni_stream(struct http_client_ctx *client, int fd)
 		break;
 
 	case H3_UNI_STREAM_PUSH:
-		/* Server should not receive push streams */
+		/* Only a server pushes: a push stream from the client is a
+		 * connection error of type H3_STREAM_CREATION_ERROR (RFC 9114
+		 * ch. 6.2.2).
+		 */
 		LOG_DBG("[%p] H3: Received push stream (unexpected for server)", client);
-		zsock_close(fd);
-		return H3_STREAM_IGNORED;
+		return -H3_STREAM_CREATION_ERROR;
 
 	default:
 		/* Unknown stream types MUST be ignored per RFC 9114, aborted
