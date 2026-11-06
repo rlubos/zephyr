@@ -667,20 +667,27 @@ static void close_client_connection(struct http_client_ctx *client)
 }
 
 /*
- * Close an HTTP/3 client, cleaning up all stream fds first so that
- * quic_stream_unref() fires for every stream before the connection fd
- * is closed. For HTTP/1.x and HTTP/2 clients this is identical to
- * close_client_connection().
+ * Close an HTTP/3 client: the request streams before the connection, so
+ * that every stream returns to the pool, and the control and QPACK streams
+ * after it, as closing them while the connection is up would ask the peer
+ * to stop sending on a critical stream (RFC 9114 ch. 6.2.1). For HTTP/1.x
+ * and HTTP/2 clients this is identical to close_client_connection().
  */
 static void close_h3_or_plain_client(struct http_client_ctx *client,
 				     struct zsock_pollfd fds[],
 				     int max_fds)
 {
+	struct h3_conn_ctx *h3 = NULL;
+
 	if (IS_ENABLED(CONFIG_HTTP_SERVER_VERSION_3) && client->is_h3) {
-		h3_client_cleanup(client, fds, max_fds);
+		h3 = h3_client_cleanup(client, fds, max_fds);
 	}
 
 	close_client_connection(client);
+
+	if (h3 != NULL) {
+		h3_conn_release(h3);
+	}
 }
 
 static void client_timeout(struct k_work *work)
@@ -1200,8 +1207,7 @@ static void handle_h3_conn_pollin(struct http_server_ctx *ctx, int i)
 		/* Hard error, connection is closing */
 		client = h3_find_client(ctx->fds[i].fd, &idx);
 		if (client != NULL) {
-			h3_client_cleanup(client, ctx->fds, ARRAY_SIZE(ctx->fds));
-			close_client_connection(client);
+			close_h3_or_plain_client(client, ctx->fds, ARRAY_SIZE(ctx->fds));
 		}
 
 		return;

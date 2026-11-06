@@ -99,9 +99,10 @@ int h3_handle_control_stream(struct http_client_ctx *client, int fd);
 int h3_handle_qpack_encoder_stream(struct http_client_ctx *client, int fd);
 int h3_handle_qpack_decoder_stream(struct http_client_ctx *client, int fd);
 struct http_client_ctx *h3_find_client(int conn_sock, int *idx);
-int h3_client_cleanup(struct http_client_ctx *client,
-		      struct zsock_pollfd fds[],
-		      int max_fds_count);
+struct h3_conn_ctx *h3_client_cleanup(struct http_client_ctx *client,
+				      struct zsock_pollfd fds[],
+				      int max_fds_count);
+void h3_conn_release(struct h3_conn_ctx *ctx);
 int h3_handle_uni_stream_data(struct http_client_ctx *client, int fd);
 bool h3_is_unidirectional_stream(int fd);
 struct http_client_ctx *h3_find_client_for_uni_stream(int fd);

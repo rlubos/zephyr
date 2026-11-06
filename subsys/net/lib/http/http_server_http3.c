@@ -3197,9 +3197,14 @@ static void remove_from_polled(int fd,
 	}
 }
 
-int h3_client_cleanup(struct http_client_ctx *client,
-		      struct zsock_pollfd fds[],
-		      int max_fds_count)
+/* The first stage of closing a client, with the connection still up: the
+ * request streams are closed and every fd of the connection is taken out of
+ * the polled set. The context is returned for h3_conn_release(), which
+ * cannot find it any more once the connection is closed.
+ */
+struct h3_conn_ctx *h3_client_cleanup(struct http_client_ctx *client,
+				      struct zsock_pollfd fds[],
+				      int max_fds_count)
 {
 	struct h3_conn_ctx *ctx;
 
@@ -3207,50 +3212,12 @@ int h3_client_cleanup(struct http_client_ctx *client,
 	if (ctx == NULL) {
 		LOG_DBG("[%p] H3 connection context not found", client);
 	} else {
-		if (ctx->peer_control_stream >= 0) {
-			remove_from_polled(ctx->peer_control_stream,
-					   fds, max_fds_count);
-			(void)zsock_close(ctx->peer_control_stream);
-			ctx->peer_control_stream = INVALID_SOCK;
-			ctx->peer_control_rx.data_len = 0;
-		}
-
-		if (ctx->peer_qpack_encoder_stream >= 0) {
-			remove_from_polled(ctx->peer_qpack_encoder_stream,
-					   fds, max_fds_count);
-			(void)zsock_close(ctx->peer_qpack_encoder_stream);
-			ctx->peer_qpack_encoder_stream = INVALID_SOCK;
-			ctx->peer_qpack_encoder_rx.data_len = 0;
-		}
-
-		if (ctx->peer_qpack_decoder_stream >= 0) {
-			remove_from_polled(ctx->peer_qpack_decoder_stream,
-					   fds, max_fds_count);
-			(void)zsock_close(ctx->peer_qpack_decoder_stream);
-			ctx->peer_qpack_decoder_stream = INVALID_SOCK;
-			ctx->peer_qpack_decoder_rx.data_len = 0;
-		}
-
-		if (ctx->local_control_stream >= 0) {
-			remove_from_polled(ctx->local_control_stream,
-					   fds, max_fds_count);
-			(void)zsock_close(ctx->local_control_stream);
-			ctx->local_control_stream = INVALID_SOCK;
-		}
-
-		if (ctx->local_qpack_encoder_stream >= 0) {
-			remove_from_polled(ctx->local_qpack_encoder_stream,
-					   fds, max_fds_count);
-			(void)zsock_close(ctx->local_qpack_encoder_stream);
-			ctx->local_qpack_encoder_stream = INVALID_SOCK;
-		}
-
-		if (ctx->local_qpack_decoder_stream >= 0) {
-			remove_from_polled(ctx->local_qpack_decoder_stream,
-					   fds, max_fds_count);
-			(void)zsock_close(ctx->local_qpack_decoder_stream);
-			ctx->local_qpack_decoder_stream = INVALID_SOCK;
-		}
+		remove_from_polled(ctx->peer_control_stream, fds, max_fds_count);
+		remove_from_polled(ctx->peer_qpack_encoder_stream, fds, max_fds_count);
+		remove_from_polled(ctx->peer_qpack_decoder_stream, fds, max_fds_count);
+		remove_from_polled(ctx->local_control_stream, fds, max_fds_count);
+		remove_from_polled(ctx->local_qpack_encoder_stream, fds, max_fds_count);
+		remove_from_polled(ctx->local_qpack_decoder_stream, fds, max_fds_count);
 
 		/*
 		 * Close all bidi request stream fds tracked in stream_sock[].
@@ -3275,13 +3242,54 @@ int h3_client_cleanup(struct http_client_ctx *client,
 
 			LOG_DBG("[%p] H3: closed stream fd %d on cleanup", client, sfd);
 		}
-
-		ctx->initialized = false;
 	}
 
 	remove_from_polled(client->h3.conn_sock, fds, max_fds_count);
 
-	return 0;
+	return ctx;
+}
+
+/* The second stage, once the connection is closed: its control and QPACK
+ * streams. Closing them while the connection is up would ask the peer to
+ * stop sending on them, which closes a critical stream (RFC 9114
+ * ch. 6.2.1).
+ */
+void h3_conn_release(struct h3_conn_ctx *ctx)
+{
+	if (ctx->peer_control_stream >= 0) {
+		(void)zsock_close(ctx->peer_control_stream);
+		ctx->peer_control_stream = INVALID_SOCK;
+		ctx->peer_control_rx.data_len = 0;
+	}
+
+	if (ctx->peer_qpack_encoder_stream >= 0) {
+		(void)zsock_close(ctx->peer_qpack_encoder_stream);
+		ctx->peer_qpack_encoder_stream = INVALID_SOCK;
+		ctx->peer_qpack_encoder_rx.data_len = 0;
+	}
+
+	if (ctx->peer_qpack_decoder_stream >= 0) {
+		(void)zsock_close(ctx->peer_qpack_decoder_stream);
+		ctx->peer_qpack_decoder_stream = INVALID_SOCK;
+		ctx->peer_qpack_decoder_rx.data_len = 0;
+	}
+
+	if (ctx->local_control_stream >= 0) {
+		(void)zsock_close(ctx->local_control_stream);
+		ctx->local_control_stream = INVALID_SOCK;
+	}
+
+	if (ctx->local_qpack_encoder_stream >= 0) {
+		(void)zsock_close(ctx->local_qpack_encoder_stream);
+		ctx->local_qpack_encoder_stream = INVALID_SOCK;
+	}
+
+	if (ctx->local_qpack_decoder_stream >= 0) {
+		(void)zsock_close(ctx->local_qpack_decoder_stream);
+		ctx->local_qpack_decoder_stream = INVALID_SOCK;
+	}
+
+	ctx->initialized = false;
 }
 
 struct http_client_ctx *h3_find_client_for_uni_stream(int fd)
