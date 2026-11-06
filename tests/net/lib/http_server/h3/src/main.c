@@ -2541,6 +2541,23 @@ ZTEST(server_h3_tests, test_h3_duplicate_critical_stream_closes_connection)
 	}
 }
 
+ZTEST(server_h3_tests, test_h3_push_stream_closes_connection)
+{
+	static const uint8_t stream_type = H3_UNI_STREAM_PUSH;
+	int push_fd;
+
+	start_h3_session(false);
+	send_get_and_expect_static(false);
+
+	/* Only a server pushes: a push stream from the client is a
+	 * connection error (RFC 9114 ch. 6.2.2).
+	 */
+	push_fd = open_client_stream(QUIC_STREAM_UNIDIRECTIONAL);
+	send_all(push_fd, &stream_type, 1);
+
+	expect_connection_closed_and_server_alive();
+}
+
 static bool buffer_contains(const uint8_t *buf, size_t len, const char *str)
 {
 	size_t str_len = strlen(str);
