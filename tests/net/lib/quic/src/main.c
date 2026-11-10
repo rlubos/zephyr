@@ -10263,4 +10263,136 @@ ZTEST(net_socket_quic, test_559_closed_stream_returns_credit)
 	zassert_ok(ret, "Cannot close socket %d (%d)", sock, -errno);
 }
 
+ZTEST(net_socket_quic, test_552_reset_stream_on_shutdown_and_close)
+{
+	struct reset_test_peers peers;
+	struct quic_stream *stream;
+	const uint8_t data[] = "abandoned";
+	uint64_t code = 0x10c;
+	uint64_t stream_id;
+	uint8_t buf[32];
+	net_socklen_t optlen;
+	int err;
+	int ret;
+
+	reset_test_connect(&peers, "127.0.0.1:54357", "127.0.0.1:19957");
+
+	ret = quic_test_send_all(peers.client_stream, data, sizeof(data));
+	zassert_ok(ret, "Failed to send on the client stream (%d)", ret);
+	recv_exactly(peers.server_stream, 1 + sizeof(data));
+
+	/* With the error code set, shutting the sending half down abandons
+	 * the stream with RESET_STREAM instead of ending it with FIN. The
+	 * frame carries the code and the end of the data sent.
+	 */
+	ret = zsock_setsockopt(peers.client_stream, ZSOCK_SOL_QUIC,
+			       ZSOCK_QUIC_SO_RESET_STREAM_CODE, &code, sizeof(code));
+	zassert_ok(ret, "Failed to set the reset code (%d)", -errno);
+
+	ret = zsock_shutdown(peers.client_stream, ZSOCK_SHUT_WR);
+	zassert_ok(ret, "Failed to shut the stream down (%d)", -errno);
+
+	wait_for_revents(peers.server_stream, ZSOCK_POLLIN | ZSOCK_POLLHUP, "the reset");
+
+	stream = find_stream(0, true);
+	zassert_true(stream->rx_reset, "The server stream was not reset");
+	zassert_equal(stream->peer_reset_error_code, code,
+		      "RESET_STREAM with error code 0x%" PRIx64, stream->peer_reset_error_code);
+	zassert_equal(stream->peer_final_size, 1 + sizeof(data),
+		      "RESET_STREAM with final size %" PRIu64 ", expected %zu",
+		      stream->peer_final_size, 1 + sizeof(data));
+
+	/* The peer reads the reset as an error */
+	ret = zsock_recv(peers.server_stream, buf, sizeof(buf), 0);
+	zassert_equal(ret, -1, "Expected an error for the reset stream (%d)", ret);
+	zassert_equal(errno, ECONNRESET, "Expected ECONNRESET for the reset stream (%d)", errno);
+
+	/* Nothing goes out on the stream any more */
+	ret = zsock_send(peers.client_stream, data, sizeof(data), 0);
+	zassert_equal(ret, -1, "Expected the send to fail on a reset stream (%d)", ret);
+	zassert_equal(errno, EPIPE, "Expected EPIPE on a reset stream (%d)", errno);
+
+	/* Nor after the peer ends its half of the stream */
+	ret = zsock_close(peers.server_stream);
+	zassert_ok(ret, "Failed to close the server stream (%d)", -errno);
+	wait_for_revents(peers.client_stream, ZSOCK_POLLIN | ZSOCK_POLLHUP, "the FIN");
+	ret = zsock_send(peers.client_stream, data, sizeof(data), 0);
+	zassert_equal(ret, -1, "Expected the send to fail on a reset stream (%d)", ret);
+	zassert_equal(errno, EPIPE, "Expected EPIPE on a reset stream (%d)", errno);
+
+	ret = zsock_close(peers.client_stream);
+	zassert_ok(ret, "Failed to close the client stream (%d)", -errno);
+
+	/* With the code set, close() alone abandons a stream as well */
+	peers.client_stream = quic_stream_open(peers.client_sock, QUIC_STREAM_CLIENT,
+					       QUIC_STREAM_BIDIRECTIONAL, 0);
+	zassert_true(peers.client_stream >= 0, "Failed to open client stream (%d)",
+		     peers.client_stream);
+	ret = quic_stream_get_id(peers.client_stream, &stream_id);
+	zassert_ok(ret, "Failed to get the stream id (%d)", ret);
+
+	/* A code that does not fit a varint is refused (RFC 9000 ch. 16) */
+	code = 1ULL << 62;
+	ret = zsock_setsockopt(peers.client_stream, ZSOCK_SOL_QUIC,
+			       ZSOCK_QUIC_SO_RESET_STREAM_CODE, &code, sizeof(code));
+	zassert_equal(ret, -1, "Accepted a reset code that does not fit a varint");
+	zassert_equal(errno, EINVAL, "Expected EINVAL for too large a code (%d)", errno);
+
+	ret = quic_test_send_all(peers.client_stream, data, 1);
+	zassert_ok(ret, "Failed to send on the client stream (%d)", ret);
+
+	wait_for_revents(peers.server_conn, ZSOCK_POLLIN, "the stream");
+	peers.server_stream = zsock_accept(peers.server_conn, NULL, NULL);
+	zassert_true(peers.server_stream >= 0, "Failed to accept the stream (%d)", -errno);
+	recv_exactly(peers.server_stream, 1);
+
+	code = 0x10b;
+	ret = zsock_setsockopt(peers.client_stream, ZSOCK_SOL_QUIC,
+			       ZSOCK_QUIC_SO_RESET_STREAM_CODE, &code, sizeof(code));
+	zassert_ok(ret, "Failed to set the reset code (%d)", -errno);
+
+	ret = zsock_close(peers.client_stream);
+	zassert_ok(ret, "Failed to close the client stream (%d)", -errno);
+
+	wait_for_revents(peers.server_stream, ZSOCK_POLLIN | ZSOCK_POLLHUP, "the reset");
+
+	stream = find_stream(stream_id, true);
+	zassert_true(stream->rx_reset, "The server stream was not reset");
+	zassert_equal(stream->peer_reset_error_code, code,
+		      "RESET_STREAM with error code 0x%" PRIx64, stream->peer_reset_error_code);
+	zassert_equal(stream->peer_final_size, 1,
+		      "RESET_STREAM with final size %" PRIu64 ", expected 1",
+		      stream->peer_final_size);
+
+	/* SO_ERROR tells a reset stream, which is read from the stream, from
+	 * a connection that is gone.
+	 */
+	optlen = sizeof(err);
+	ret = zsock_getsockopt(peers.server_stream, ZSOCK_SOL_SOCKET, ZSOCK_SO_ERROR, &err,
+			       &optlen);
+	zassert_ok(ret, "Failed to read SO_ERROR (%d)", -errno);
+	zassert_equal(err, 0, "SO_ERROR %d on a reset stream of a live connection", err);
+
+	ret = quic_connection_close(peers.client_sock);
+	zassert_ok(ret, "Failed to close the client connection (%d)", ret);
+
+	for (int i = 0; i < 100 && err == 0; i++) {
+		k_msleep(10);
+		optlen = sizeof(err);
+		ret = zsock_getsockopt(peers.server_stream, ZSOCK_SOL_SOCKET, ZSOCK_SO_ERROR,
+				       &err, &optlen);
+		zassert_ok(ret, "Failed to read SO_ERROR (%d)", -errno);
+	}
+
+	zassert_equal(err, ECONNRESET, "SO_ERROR %d once the connection is gone", err);
+
+	ret = zsock_close(peers.server_stream);
+	zassert_ok(ret, "Failed to close the server stream (%d)", -errno);
+
+	ret = quic_connection_close(peers.server_conn);
+	zassert_ok(ret, "Failed to close the server connection (%d)", ret);
+	ret = quic_connection_close(peers.server_sock);
+	zassert_ok(ret, "Failed to close the server socket (%d)", ret);
+}
+
 ZTEST_SUITE(net_socket_quic, NULL, setup, before, after, NULL);
