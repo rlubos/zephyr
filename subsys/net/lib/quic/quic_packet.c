@@ -961,8 +961,11 @@ static int quic_send_reset_stream(struct quic_endpoint *ep,
 				  uint64_t error_code,
 				  uint64_t final_size)
 {
+	enum quic_secret_level level;
 	uint8_t frame[32];
+	uint64_t sent_pn;
 	int pos = 0;
+	int ret;
 	int n;
 
 	frame[pos++] = QUIC_FRAME_TYPE_RESET_STREAM;
@@ -994,7 +997,15 @@ static int quic_send_reset_stream(struct quic_endpoint *ep,
 		" error=0x%" PRIx64,
 		ep, quic_get_by_ep(ep), stream_id, error_code);
 
-	return quic_send_packet(ep, quic_stream_send_level(ep), frame, pos);
+	level = quic_stream_send_level(ep);
+	ret = quic_send_packet_with_pn(ep, level, frame, pos, &sent_pn);
+	if (ret < 0) {
+		return ret;
+	}
+
+	quic_annotate_sent_reset(ep, level, sent_pn, stream_id, error_code, final_size);
+
+	return 0;
 }
 
 /**

@@ -171,6 +171,11 @@ struct quic_sent_pkt_info {
 	 */
 	bool has_stream_frame;
 	bool stream_fin;
+	/* The frame is a RESET_STREAM, with the final size as offset and
+	 * the application error code in stream_error_code.
+	 */
+	bool stream_reset;
+	uint64_t stream_error_code;
 	uint64_t stream_id;
 	uint64_t stream_offset;   /* byte offset within the stream */
 	uint16_t stream_data_len; /* payload bytes in this frame */
@@ -1715,6 +1720,8 @@ void quic_close_frame_at_level(enum quic_secret_level level, uint8_t *type,
 			       const char **reason);
 int quic_stream_recv(struct quic_stream *stream, uint8_t *buf,
 		     size_t buf_len, int32_t timeout);
+void quic_retransmit_stream_frame(struct quic_endpoint *ep,
+				  const struct quic_sent_pkt_info *lost);
 int process_handshake_message(struct quic_tls_context *ctx,
 			      uint8_t msg_type,
 			      const uint8_t *msg, size_t msg_len,

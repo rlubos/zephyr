@@ -4759,13 +4759,15 @@ static int quic_dplpmtud_maybe_probe(struct quic_endpoint *ep)
 	}
 }
 
-static void quic_annotate_sent_stream(struct quic_endpoint *ep,
-				      enum quic_secret_level level,
-				      uint64_t pkt_num,
-				      uint64_t stream_id,
-				      uint64_t stream_offset,
-				      uint16_t stream_data_len,
-				      bool stream_fin)
+static void quic_annotate_sent(struct quic_endpoint *ep,
+			       enum quic_secret_level level,
+			       uint64_t pkt_num,
+			       uint64_t stream_id,
+			       uint64_t stream_offset,
+			       uint16_t stream_data_len,
+			       bool stream_fin,
+			       bool stream_reset,
+			       uint64_t stream_error_code)
 {
 	int pn_space = level_to_pn_space(level);
 	bool found = false;
@@ -4789,6 +4791,8 @@ static void quic_annotate_sent_stream(struct quic_endpoint *ep,
 		info->stream_offset = stream_offset;
 		info->stream_data_len = stream_data_len;
 		info->stream_fin = stream_fin;
+		info->stream_reset = stream_reset;
+		info->stream_error_code = stream_error_code;
 		found = true;
 		break;
 	}
@@ -4799,6 +4803,29 @@ static void quic_annotate_sent_stream(struct quic_endpoint *ep,
 		NET_DBG("[EP:%p/%d] Cannot annotate stream frame for pn=%" PRIu64,
 			ep, quic_get_by_ep(ep), pkt_num);
 	}
+}
+
+static void quic_annotate_sent_stream(struct quic_endpoint *ep,
+				      enum quic_secret_level level,
+				      uint64_t pkt_num,
+				      uint64_t stream_id,
+				      uint64_t stream_offset,
+				      uint16_t stream_data_len,
+				      bool stream_fin)
+{
+	quic_annotate_sent(ep, level, pkt_num, stream_id, stream_offset, stream_data_len,
+			   stream_fin, false, 0);
+}
+
+/* A RESET_STREAM is sent again until it is acknowledged (RFC 9000 ch. 13.3) */
+static void quic_annotate_sent_reset(struct quic_endpoint *ep,
+				     enum quic_secret_level level,
+				     uint64_t pkt_num,
+				     uint64_t stream_id,
+				     uint64_t error_code,
+				     uint64_t final_size)
+{
+	quic_annotate_sent(ep, level, pkt_num, stream_id, final_size, 0, false, true, error_code);
 }
 
 /* Scratch buffer for stream-frame retransmission. The lost payload is copied
@@ -4813,8 +4840,8 @@ static void quic_annotate_sent_stream(struct quic_endpoint *ep,
 static uint8_t quic_retransmit_payload[CONFIG_QUIC_TX_BUFFER_SIZE];
 static K_MUTEX_DEFINE(quic_retransmit_lock);
 
-static void quic_retransmit_stream_frame(struct quic_endpoint *ep,
-					 const struct quic_sent_pkt_info *lost)
+ZTESTABLE_STATIC void quic_retransmit_stream_frame(struct quic_endpoint *ep,
+						   const struct quic_sent_pkt_info *lost)
 {
 	/* Small fixed header, 1 + 8 + 8 + 8 bytes max */
 	uint8_t hdr[32];
@@ -4828,8 +4855,23 @@ static void quic_retransmit_stream_frame(struct quic_endpoint *ep,
 	uint64_t sent_pn;
 	int ret;
 
+	/* RFC 9000 ch. 13.3: a lost RESET_STREAM is sent again, from what
+	 * the record holds, as the stream is closed by then as often as not.
+	 */
+	if (lost->stream_reset) {
+		(void)quic_send_reset_stream(ep, lost->stream_id, lost->stream_error_code,
+					     lost->stream_offset);
+		return;
+	}
+
 	stream = quic_find_stream_by_id(ep, lost->stream_id);
 	if (stream == NULL) {
+		return;
+	}
+
+	/* No data of a stream that was reset is retransmitted */
+	if (stream->tx_reset) {
+		quic_stream_unref(stream);
 		return;
 	}
 
