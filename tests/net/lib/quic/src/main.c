@@ -10263,14 +10263,45 @@ ZTEST(net_socket_quic, test_559_closed_stream_returns_credit)
 	zassert_ok(ret, "Cannot close socket %d (%d)", sock, -errno);
 }
 
+/* The tracked RESET_STREAM of a stream in the sent packet history, and how
+ * many there are.
+ */
+static struct quic_sent_pkt_info *find_sent_reset(struct quic_endpoint *ep, uint64_t stream_id,
+						  int *count)
+{
+	struct quic_sent_pkt_info *found = NULL;
+
+	*count = 0;
+
+	for (int space = 0; space < ARRAY_SIZE(ep->recovery.sent_pkts); space++) {
+		for (int i = 0; i < CONFIG_QUIC_SENT_PKT_HISTORY_SIZE; i++) {
+			struct quic_sent_pkt_info *info = &ep->recovery.sent_pkts[space][i];
+
+			if (info->has_stream_frame && info->stream_reset &&
+			    info->stream_id == stream_id) {
+				found = info;
+				(*count)++;
+			}
+		}
+	}
+
+	return found;
+}
+
 ZTEST(net_socket_quic, test_552_reset_stream_on_shutdown_and_close)
 {
 	struct reset_test_peers peers;
+	struct quic_sent_pkt_info *reset_pkt;
+	struct quic_sent_pkt_info lost;
 	struct quic_stream *stream;
+	struct quic_context *ctx;
+	struct quic_endpoint *ep;
 	const uint8_t data[] = "abandoned";
 	uint64_t code = 0x10c;
 	uint64_t stream_id;
 	uint8_t buf[32];
+	int reset_pkts;
+	int resent_pkts;
 	net_socklen_t optlen;
 	int err;
 	int ret;
@@ -10283,7 +10314,7 @@ ZTEST(net_socket_quic, test_552_reset_stream_on_shutdown_and_close)
 
 	/* With the error code set, shutting the sending half down abandons
 	 * the stream with RESET_STREAM instead of ending it with FIN. The
-	 * frame carries the code and the end of the data sent.
+	 * frame carries the code and the number of bytes sent.
 	 */
 	ret = zsock_setsockopt(peers.client_stream, ZSOCK_SOL_QUIC,
 			       ZSOCK_QUIC_SO_RESET_STREAM_CODE, &code, sizeof(code));
@@ -10312,6 +10343,25 @@ ZTEST(net_socket_quic, test_552_reset_stream_on_shutdown_and_close)
 	zassert_equal(ret, -1, "Expected the send to fail on a reset stream (%d)", ret);
 	zassert_equal(errno, EPIPE, "Expected EPIPE on a reset stream (%d)", errno);
 
+	/* The RESET_STREAM is tracked for loss recovery and sent again when
+	 * its packet is lost (RFC 9000 ch. 13.3).
+	 */
+	ctx = quic_get_context(peers.client_sock);
+	zassert_not_null(ctx, "No context for the client connection");
+	ep = SYS_SLIST_PEEK_HEAD_CONTAINER(&ctx->endpoints, ep, node);
+	zassert_not_null(ep, "No endpoint for the client connection");
+
+	reset_pkt = find_sent_reset(ep, 0, &reset_pkts);
+	zassert_not_null(reset_pkt, "RESET_STREAM not tracked for retransmission");
+	zassert_equal(reset_pkt->stream_offset, 1 + sizeof(data),
+		      "RESET_STREAM tracked with final size %" PRIu64, reset_pkt->stream_offset);
+
+	lost = *reset_pkt;
+	quic_retransmit_stream_frame(ep, &lost);
+	(void)find_sent_reset(ep, 0, &resent_pkts);
+	zassert_true(resent_pkts > reset_pkts, "Lost RESET_STREAM was not sent again (%d, %d)",
+		     reset_pkts, resent_pkts);
+
 	/* Nor after the peer ends its half of the stream */
 	ret = zsock_close(peers.server_stream);
 	zassert_ok(ret, "Failed to close the server stream (%d)", -errno);
@@ -10322,6 +10372,16 @@ ZTEST(net_socket_quic, test_552_reset_stream_on_shutdown_and_close)
 
 	ret = zsock_close(peers.client_stream);
 	zassert_ok(ret, "Failed to close the client stream (%d)", -errno);
+
+	wait_for_streams_released();
+
+	/* Also once the stream is closed, from the record alone */
+	reset_pkts = resent_pkts;
+	quic_retransmit_stream_frame(ep, &lost);
+	(void)find_sent_reset(ep, 0, &resent_pkts);
+	zassert_true(resent_pkts > reset_pkts,
+		     "Lost RESET_STREAM of a closed stream was not sent again (%d, %d)",
+		     reset_pkts, resent_pkts);
 
 	/* With the code set, close() alone abandons a stream as well */
 	peers.client_stream = quic_stream_open(peers.client_sock, QUIC_STREAM_CLIENT,
