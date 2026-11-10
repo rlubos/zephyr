@@ -885,6 +885,11 @@ struct quic_endpoint {
 		uint64_t bytes_received; /* Connection flow-control credit consumed */
 		uint64_t max_data_sent;  /* Last MAX_DATA value we sent */
 		bool need_window_update; /* Flag to send MAX_DATA */
+		/* Protects max_data and max_data_sent, which the application
+		 * thread grows as it reads and the receive thread as data is
+		 * dropped or streams are reset.
+		 */
+		struct k_spinlock lock;
 	} rx_fc;
 
 #if defined(CONFIG_QUIC_SERVER_ANTI_AMPLIFICATION_LIMIT)
@@ -1188,6 +1193,11 @@ __net_socket struct quic_stream {
 	/** RX flow control, highest received stream end offset (offset + len) */
 	uint64_t highest_offset_received;
 
+	/** RX flow control, bytes of the stream handed back to the connection
+	 * window: read by the application, discarded, or never to be read.
+	 */
+	uint64_t rx_credited;
+
 	/** RX flow control, last MAX_STREAM_DATA value we sent */
 	uint64_t local_max_data_sent;
 
@@ -1389,6 +1399,19 @@ static inline bool quic_stream_id_is_local(uint64_t stream_id, bool is_server)
 static inline bool quic_stream_id_is_send_only(uint64_t stream_id, bool is_server)
 {
 	return (stream_id & 2U) != 0U && quic_stream_id_is_local(stream_id, is_server);
+}
+
+/* The connection credit the peer has left (RFC 9000 ch. 4.1), read under the
+ * lock as the application thread grows the window meanwhile.
+ */
+static inline uint64_t quic_rx_window_left(struct quic_endpoint *ep)
+{
+	k_spinlock_key_t key = k_spin_lock(&ep->rx_fc.lock);
+	uint64_t left = ep->rx_fc.max_data - ep->rx_fc.bytes_received;
+
+	k_spin_unlock(&ep->rx_fc.lock, key);
+
+	return left;
 }
 
 #if defined(CONFIG_QUIC_STATS_HISTORY)
@@ -1651,6 +1674,7 @@ int parse_client_hello(struct quic_tls_context *ctx,
 		       const uint8_t *full_msg, size_t full_msg_len);
 int parse_server_hello(struct quic_tls_context *ctx,
 		       const uint8_t *msg, size_t msg_len);
+void quic_rx_stream_closed(struct quic_endpoint *ep, struct quic_stream *stream);
 int handle_crypto_level_packet(struct quic_endpoint *ep,
 			       enum quic_secret_level level,
 			       const uint8_t *payload,
