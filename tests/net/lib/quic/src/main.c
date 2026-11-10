@@ -10270,6 +10270,57 @@ ZTEST(net_socket_quic, test_552_reset_stream_on_shutdown_and_close)
 	zassert_ok(ret, "Failed to close the server socket (%d)", ret);
 }
 
+ZTEST(net_socket_quic, test_558_receive_only_stream_is_neither_reset_nor_ended)
+{
+	struct reset_test_peers peers;
+	uint64_t code = 0x10c;
+	int client_uni;
+	int server_uni;
+	int ret;
+
+	reset_test_connect(&peers, "127.0.0.1:54362", "127.0.0.1:19962");
+
+	/* A unidirectional stream of the client is receive-only at the server */
+	client_uni = quic_stream_open(peers.client_sock, QUIC_STREAM_CLIENT,
+				      QUIC_STREAM_UNIDIRECTIONAL, 0);
+	zassert_true(client_uni >= 0, "Failed to open a unidirectional stream (%d)", client_uni);
+	ret = quic_test_send_all(client_uni, (const uint8_t *)"x", 1);
+	zassert_ok(ret, "Failed to send on the unidirectional stream (%d)", ret);
+
+	wait_for_revents(peers.server_conn, ZSOCK_POLLIN, "the unidirectional stream");
+	server_uni = zsock_accept(peers.server_conn, NULL, NULL);
+	zassert_true(server_uni >= 0, "Failed to accept the unidirectional stream (%d)", -errno);
+	recv_exactly(server_uni, 1);
+
+	/* It has no sending half to abandon (RFC 9000 ch. 3) */
+	ret = zsock_setsockopt(server_uni, ZSOCK_SOL_QUIC, ZSOCK_QUIC_SO_RESET_STREAM_CODE,
+			       &code, sizeof(code));
+	zassert_equal(ret, -1, "Armed a reset on a receive-only stream");
+	zassert_equal(errno, EINVAL, "Expected EINVAL for a receive-only stream (%d)", errno);
+
+	/* Nor one to end: once the client has ended the stream, shutting it
+	 * down and closing it at the server sends nothing on it.
+	 */
+	ret = zsock_close(client_uni);
+	zassert_ok(ret, "Failed to close the client stream (%d)", -errno);
+	wait_for_revents(server_uni, ZSOCK_POLLIN | ZSOCK_POLLHUP, "the FIN");
+	ret = zsock_recv(server_uni, &code, sizeof(code), 0);
+	zassert_equal(ret, 0, "Expected the end of the stream (%d)", ret);
+
+	ret = zsock_shutdown(server_uni, ZSOCK_SHUT_RDWR);
+	zassert_ok(ret, "Failed to shut the stream down (%d)", -errno);
+	ret = zsock_close(server_uni);
+	zassert_ok(ret, "Failed to close the server stream (%d)", -errno);
+	wait_for_streams(2);
+
+	ret = zsock_close(peers.client_stream);
+	zassert_ok(ret, "Failed to close the client stream (%d)", -errno);
+	ret = zsock_close(peers.server_stream);
+	zassert_ok(ret, "Failed to close the server stream (%d)", -errno);
+
+	reset_test_disconnect(&peers);
+}
+
 /* A STREAM frame with an offset, as stream_frame_for(), for an endpoint of a
  * connection: the frame handler looks the connection up.
  */
