@@ -1067,6 +1067,21 @@ static int quic_wait_for_application_send_ready(struct quic_endpoint *ep,
 	return 0;
 }
 
+/* Whether the stream only carries data from the peer: a unidirectional
+ * stream the peer opened has no sending half here.
+ */
+static bool quic_stream_is_receive_only(const struct quic_stream *stream)
+{
+	const struct quic_endpoint *ep = stream->ep;
+
+	if (ep == NULL) {
+		return false;
+	}
+
+	return (stream->type & QUIC_STREAM_UNIDIRECTIONAL) != 0 &&
+	       !quic_stream_id_is_local(stream->id, ep->is_server);
+}
+
 /**
  * Send a STREAM frame with the FIN bit set and zero payload.
  * This signals to the peer that we have finished sending on this stream.
@@ -1160,6 +1175,63 @@ static int quic_send_stream_fin(struct quic_stream *stream, struct quic_endpoint
 	return 0;
 }
 
+/* Abandon the sending half of the stream with RESET_STREAM, RFC 9000 ch. 3.1:
+ * possible until all data sent is acknowledged, nothing to do once a reset
+ * went out either way.
+ */
+static int quic_stream_reset_sending(struct quic_stream *stream, struct quic_endpoint *ep)
+{
+	int state = quic_stream_get_state(stream);
+	uint64_t final_size;
+	bool reset;
+	int ret;
+
+	if (state == STATE_RESET_SENT ||
+	    state == STATE_RESET_RECVD ||
+	    state == STATE_RESET_READ ||
+	    state == STATE_DATA_RECVD ||
+	    state == STATE_DATA_READ) {
+		return 0;
+	}
+
+	/* The final size is fixed by the first reset as the end of the data
+	 * queued for sending, under the lock the send path checks tx_reset
+	 * with, so that nothing is sent past it (RFC 9000 ch. 4.5).
+	 */
+	k_mutex_lock(&stream->tx_lock, K_FOREVER);
+
+	reset = stream->tx_reset;
+	if (!reset) {
+		stream->tx_reset = true;
+		stream->tx_final_size = stream->tx_buf.base_offset + stream->tx_buf.len;
+	}
+
+	final_size = stream->tx_final_size;
+
+	k_mutex_unlock(&stream->tx_lock);
+
+	if (reset) {
+		return 0;
+	}
+
+	ret = quic_send_reset_stream(ep, stream->id, stream->reset_stream_error_code, final_size);
+	if (ret < 0) {
+		NET_DBG("[ST:%p/%d] Failed to send RESET_STREAM for stream %" PRIu64 " : %d",
+			stream, quic_get_by_stream(stream), stream->id, ret);
+		return ret;
+	}
+
+	smf_set_state(SMF_CTX(&stream->state.ctx),
+		      &quic_stream_bidirectional_states[STATE_RESET_SENT]);
+
+	NET_DBG("[ST:%p/%d] Sent RESET_STREAM for stream %" PRIu64 " with code 0x%" PRIx64
+		" and final size %" PRIu64,
+		stream, quic_get_by_stream(stream), stream->id,
+		stream->reset_stream_error_code, final_size);
+
+	return 0;
+}
+
 static uint64_t quic_stream_remote_tx_limit(const struct quic_endpoint *ep, uint64_t stream_id)
 {
 	bool local_initiator = (stream_id & 0x01U) == (ep->is_server ? 0x01U : 0x00U);
@@ -1199,7 +1271,7 @@ static ssize_t quic_stream_replay_pending_data(struct quic_stream *stream)
 
 	level = quic_stream_send_level(ep);
 	state = quic_stream_get_state(stream);
-	if (state == STATE_RESET_SENT || state == STATE_DATA_READ) {
+	if (stream->tx_reset || state == STATE_RESET_SENT || state == STATE_DATA_READ) {
 		return -EPIPE;
 	}
 
@@ -1432,9 +1504,11 @@ static ssize_t quic_stream_send(struct quic_stream *stream, const uint8_t *buf,
 		return -ENOTCONN;
 	}
 
-	/* Check if the stream is in a state that allows sending */
+	/* Check if the stream is in a state that allows sending. Nothing is
+	 * sent after a RESET_STREAM, whatever the peer did to the stream since.
+	 */
 	state = quic_stream_get_state(stream);
-	if (state == STATE_RESET_SENT || state == STATE_DATA_READ) {
+	if (stream->tx_reset || state == STATE_RESET_SENT || state == STATE_DATA_READ) {
 		NET_DBG("[ST:%p/%d] Wrong state %d for sending", stream,
 			quic_get_by_stream(stream), state);
 		return -EPIPE;
@@ -2312,6 +2386,28 @@ static int quic_stream_setsockopt_ctx(void *obj, int level, int optname,
 			stream->stop_sending_error_code = code;
 			return 0;
 		}
+		case ZSOCK_QUIC_SO_RESET_STREAM_CODE: {
+			uint64_t code;
+
+			if (optval == NULL || optlen != sizeof(code)) {
+				errno = EINVAL;
+				return -1;
+			}
+
+			memcpy(&code, optval, sizeof(code));
+
+			/* The code has to fit a varint, and there is no sending
+			 * half to abandon on a receive-only stream.
+			 */
+			if (code > QUIC_VARINT_MAX || quic_stream_is_receive_only(stream)) {
+				errno = EINVAL;
+				return -1;
+			}
+
+			stream->reset_stream_error_code = code;
+			stream->reset_sending = true;
+			return 0;
+		}
 		default:
 			return -ENOTSUP;
 		}
@@ -2339,22 +2435,27 @@ static int quic_stream_close_vmeth(void *obj)
 	ep = quic_stream_endpoint_get(stream);
 
 	/*
-	 * Send FIN to the peer to cleanly terminate the send side of the stream.
-	 * Skip if:
+	 * Send FIN to the peer to cleanly terminate the send side of the stream,
+	 * or RESET_STREAM when the application abandoned it. Skip if:
 	 *   - No endpoint (connection already gone)
 	 *   - Stream was reset (RESET_STREAM already sent/received)
 	 *   - FIN was already sent (DATA_SENT or DATA_RECVD)
 	 */
-	if (ep != NULL && ep->crypto.application.initialized) {
-		state = quic_stream_get_state(stream);
+	if (ep != NULL && (ep->crypto.application.initialized || quic_early_data_is_armed(ep))) {
+		if (stream->reset_sending) {
+			(void)quic_stream_reset_sending(stream, ep);
+		} else {
+			state = quic_stream_get_state(stream);
 
-		if (state != STATE_RESET_SENT &&
-		    state != STATE_RESET_RECVD &&
-		    state != STATE_RESET_READ &&
-		    state != STATE_DATA_SENT &&
-		    state != STATE_DATA_RECVD &&
-		    state != STATE_DATA_READ) {
-			(void)quic_send_stream_fin(stream, ep);
+			if (!stream->tx_reset &&
+			    state != STATE_RESET_SENT &&
+			    state != STATE_RESET_RECVD &&
+			    state != STATE_RESET_READ &&
+			    state != STATE_DATA_SENT &&
+			    state != STATE_DATA_RECVD &&
+			    state != STATE_DATA_READ) {
+				(void)quic_send_stream_fin(stream, ep);
+			}
 		}
 	}
 
@@ -2395,21 +2496,30 @@ static int quic_stream_shutdown_vmeth(void *obj, int how)
 		return 0;
 	}
 
-	if (!ep->crypto.application.initialized) {
+	if (!ep->crypto.application.initialized && !quic_early_data_is_armed(ep)) {
 		goto out;
 	}
 
 	/*
-	 * SHUT_WR (or SHUT_RDWR): send a STREAM+FIN to close our sending half.
-	 * RFC 9000 ch. 2.4.
+	 * SHUT_WR (or SHUT_RDWR): send a STREAM+FIN to close our sending half,
+	 * RFC 9000 ch. 2.4, or a RESET_STREAM to abandon it when the
+	 * application asked for that.
 	 */
-	if (how == ZSOCK_SHUT_WR || how == ZSOCK_SHUT_RDWR) {
+	if ((how == ZSOCK_SHUT_WR || how == ZSOCK_SHUT_RDWR) && stream->reset_sending) {
+		ret = quic_stream_reset_sending(stream, ep);
+		if (ret < 0) {
+			goto out;
+		}
+	} else if (how == ZSOCK_SHUT_WR || how == ZSOCK_SHUT_RDWR) {
 		int state;
 
 		state = quic_stream_get_state(stream);
 
-		/* Only send FIN if we haven't already (state machine guard) */
-		if (state != STATE_DATA_SENT &&
+		/* Only send FIN if we haven't already (state machine guard),
+		 * and never after a RESET_STREAM.
+		 */
+		if (!stream->tx_reset &&
+		    state != STATE_DATA_SENT &&
 		    state != STATE_DATA_RECVD &&
 		    state != STATE_DATA_READ &&
 		    state != STATE_RESET_SENT &&

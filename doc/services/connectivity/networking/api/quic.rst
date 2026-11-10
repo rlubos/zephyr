@@ -174,6 +174,32 @@ descriptor for a new stream initiated by a peer.
    }
 
 
+Ending and Aborting Streams
+---------------------------
+
+:c:func:`zsock_shutdown` on a stream socket maps to the stream states of
+:rfc:`9000` Section 3:
+
+* ``ZSOCK_SHUT_WR`` ends the sending half with a FIN. The peer reads the data
+  sent so far, then an end of stream (``zsock_recv()`` returns 0).
+* ``ZSOCK_SHUT_RD`` asks the peer to stop sending with STOP_SENDING, carrying
+  the error code set with ``ZSOCK_QUIC_SO_STOP_SENDING_CODE``. Data still in
+  flight is discarded.
+
+To abandon the sending half instead of ending it, set the application error
+code with ``ZSOCK_QUIC_SO_RESET_STREAM_CODE`` first. ``shutdown(ZSOCK_SHUT_WR)``
+and ``zsock_close()`` then send RESET_STREAM with that code, and the peer's
+``zsock_recv()`` fails with ``ECONNRESET`` once it has read the data that
+reached it before the reset. A stream reset by the peer is read the same way
+(:rfc:`9000` Section 3.2).
+
+.. code-block:: c
+
+   uint64_t code = 0x10c; /* H3_REQUEST_CANCELLED */
+
+   zsock_setsockopt(stream_sock, ZSOCK_SOL_QUIC, ZSOCK_QUIC_SO_RESET_STREAM_CODE,
+                    &code, sizeof(code));
+   zsock_close(stream_sock);
 Socket Options of the Connection
 --------------------------------
 

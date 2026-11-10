@@ -206,6 +206,22 @@ enum {
 	 * (@rfc{9000,section-10.2.3}).
 	 */
 	ZSOCK_QUIC_SO_APPLICATION_CLOSE_CODE = 10,
+
+	/**
+	 * Abandon the sending half of a stream with RESET_STREAM.
+	 *
+	 * The option value is a pointer to a uint64_t holding the application
+	 * error code and is only valid on QUIC stream sockets. Once it is set,
+	 * shutdown() with ZSOCK_SHUT_WR or ZSOCK_SHUT_RDWR and close() send a
+	 * RESET_STREAM frame with that code instead of ending the stream with
+	 * a FIN (@rfc{9000,section-3.1}). The end of the data queued for
+	 * sending is the final size of the stream (@rfc{9000,section-4.5});
+	 * nothing is sent after the reset. The
+	 * peer reads the reset as ECONNRESET once it has read the data that
+	 * reached it before. Before the handshake is complete the frame goes
+	 * out as early data when 0-RTT is armed, like the data itself.
+	 */
+	ZSOCK_QUIC_SO_RESET_STREAM_CODE = 11,
 };
 
 /** How the peer closed the connection, see ZSOCK_QUIC_SO_PEER_CLOSE. */

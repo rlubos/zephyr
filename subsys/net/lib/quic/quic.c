@@ -399,6 +399,10 @@ ZTESTABLE_STATIC int quic_send_packet(struct quic_endpoint *ep,
 				      const uint8_t *payload,
 				      size_t payload_len);
 static int quic_send_streams_blocked(struct quic_endpoint *ep, bool bidi, uint64_t limit);
+static int quic_send_reset_stream(struct quic_endpoint *ep,
+				  uint64_t stream_id,
+				  uint64_t error_code,
+				  uint64_t final_size);
 static int quic_send_stop_sending(struct quic_endpoint *ep,
 				  uint64_t stream_id,
 				  uint64_t error_code);
@@ -6212,6 +6216,8 @@ static struct quic_stream *quic_stream_init(struct quic_stream *stream)
 	stream->tx_final_size = 0;
 	stream->rx_reset = false;
 	stream->final_size_known = false;
+	stream->reset_sending = false;
+	stream->reset_stream_error_code = QUIC_ERROR_NO_ERROR;
 	stream->peer_reset_error_code = QUIC_ERROR_NO_ERROR;
 	stream->peer_final_size = 0;
 

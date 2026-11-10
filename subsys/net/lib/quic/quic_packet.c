@@ -994,7 +994,7 @@ static int quic_send_reset_stream(struct quic_endpoint *ep,
 		" error=0x%" PRIx64,
 		ep, quic_get_by_ep(ep), stream_id, error_code);
 
-	return quic_send_packet(ep, QUIC_SECRET_LEVEL_APPLICATION, frame, pos);
+	return quic_send_packet(ep, quic_stream_send_level(ep), frame, pos);
 }
 
 /**
@@ -1034,7 +1034,7 @@ static int quic_send_stop_sending(struct quic_endpoint *ep,
 	NET_DBG("[EP:%p/%d] Sending STOP_SENDING: stream=%" PRIu64 " error=0x%" PRIx64,
 		ep, quic_get_by_ep(ep), stream_id, error_code);
 
-	return quic_send_packet(ep, QUIC_SECRET_LEVEL_APPLICATION, frame, pos);
+	return quic_send_packet(ep, quic_stream_send_level(ep), frame, pos);
 }
 
 static int handle_stop_sending_frame(struct quic_endpoint *ep,
@@ -1141,15 +1141,20 @@ static int handle_stop_sending_frame(struct quic_endpoint *ep,
 	if (!repeated) {
 		stream->tx_reset = true;
 		stream->tx_final_size = stream->tx_buf.base_offset + stream->tx_buf.len;
+		stream->reset_stream_error_code = error_code;
 	}
 
 	final_size = stream->tx_final_size;
 
 	k_mutex_unlock(&stream->tx_lock);
 
+	/* A repeat carries the code of the first RESET_STREAM, whichever
+	 * side asked for it.
+	 */
 	if (repeated) {
 		if (quic_reply_budget_take(budget)) {
-			quic_send_reset_stream(ep, stream_id, error_code, final_size);
+			quic_send_reset_stream(ep, stream_id, stream->reset_stream_error_code,
+					       final_size);
 		}
 	} else {
 		/* Send RESET_STREAM, our TX side is being abandoned */

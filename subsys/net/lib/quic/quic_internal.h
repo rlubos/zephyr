@@ -1228,6 +1228,9 @@ __net_socket struct quic_stream {
 	 */
 	uint64_t stop_sending_error_code;
 
+	/** Error code sent in RESET_STREAM when the sending half is abandoned */
+	uint64_t reset_stream_error_code;
+
 	/** Error code of the RESET_STREAM received from the peer */
 	uint64_t peer_reset_error_code;
 
@@ -1287,6 +1290,9 @@ __net_socket struct quic_stream {
 
 	/** peer_final_size is known (RFC 9000 ch. 4.5) */
 	bool final_size_known : 1;
+
+	/** Sending half abandoned: shutdown and close send RESET_STREAM, not FIN */
+	bool reset_sending : 1;
 
 	/** A rejected 0-RTT FIN must be replayed after queued data is resent. */
 	bool replay_fin_pending : 1;
