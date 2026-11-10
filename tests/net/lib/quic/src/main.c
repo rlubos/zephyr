@@ -9765,6 +9765,26 @@ ZTEST(net_socket_quic, test_551_peer_reset_stream_reads_as_error)
 	ret = quic_stream_receive_data(&test_stream, 0, data, sizeof(data), false);
 	zassert_ok(ret, "Cannot queue received data (%d)", ret);
 
+	/* A RESET_STREAM for a unidirectional stream of ours, which carries
+	 * nothing from the peer, is a connection error (RFC 9000 ch. 19.4).
+	 */
+	ret = reset_stream_for(ep, 2, 0x3f, 0);
+	zassert_equal(ret, -EPROTO,
+		      "RESET_STREAM for a send-only stream must close the connection (%d)",
+		      ret);
+
+	/* So is one for a stream of ours that was never opened, as a STREAM
+	 * or a STOP_SENDING frame for it is (RFC 9000 ch. 19.5, 19.8). The
+	 * parser drops a reference when it gives up on the connection.
+	 */
+	atomic_set(&ep->refcount, 2);
+	sys_slist_append(&ctx->endpoints, &ep->node);
+	ret = reset_stream_for(ep, 0, 0x3f, 0);
+	(void)sys_slist_find_and_remove(&ctx->endpoints, &ep->node);
+	zassert_equal(ret, -EPROTO,
+		      "RESET_STREAM for a stream never opened must close the connection (%d)",
+		      ret);
+
 	/* The reset is kept with the error code and the final size of the
 	 * frame. The parser gives back the reference it takes.
 	 */
