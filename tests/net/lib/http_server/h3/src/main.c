@@ -41,6 +41,14 @@
 #define H3_UNI_STREAM_PUSH 0x01
 #define H3_UNI_STREAM_QPACK_ENCODER 0x02
 
+/* HTTP/3 error codes (RFC 9114 ch. 8.1) */
+#define H3_STREAM_CREATION_ERROR 0x0103
+#define H3_CLOSED_CRITICAL_STREAM 0x0104
+#define H3_FRAME_UNEXPECTED 0x0105
+#define H3_FRAME_ERROR 0x0106
+#define H3_ID_ERROR 0x0108
+#define H3_SETTINGS_ERROR 0x0109
+
 /* HTTP/3 error code (RFC 9114 Section 8.1) */
 #define H3_REQUEST_CANCELLED 0x10c
 #define H3_UNI_STREAM_QPACK_DECODER 0x03
@@ -1772,7 +1780,8 @@ static int start_h3_session_with_control_data(const uint8_t *data, size_t len)
 }
 
 /* The server gave up on the connection and still serves a new one */
-static void expect_connection_closed_and_server_alive(void)
+/* Wait for the server to close the client connection */
+static void wait_for_connection_closed(void)
 {
 	int64_t end = k_uptime_get() + RECV_TIMEOUT_S * MSEC_PER_SEC;
 	struct zsock_pollfd pfd = {
@@ -1796,6 +1805,26 @@ static void expect_connection_closed_and_server_alive(void)
 
 	zassert_true((pfd.revents & ZSOCK_POLLHUP) != 0,
 		     "Connection was not closed (0x%x)", pfd.revents);
+}
+
+/* Wait for the server to close the connection for an error of the protocol,
+ * check the HTTP/3 code it gives (RFC 9114 ch. 8), then check that the
+ * server still takes a new connection.
+ */
+static void expect_connection_error_and_server_alive(uint64_t code)
+{
+	struct quic_peer_close close;
+	net_socklen_t optlen = sizeof(close);
+	int ret;
+
+	wait_for_connection_closed();
+
+	ret = zsock_getsockopt(client_conn_fd, ZSOCK_SOL_QUIC, ZSOCK_QUIC_SO_PEER_CLOSE, &close,
+			       &optlen);
+	zassert_ok(ret, "Failed to read the peer close (%d)", errno);
+	zassert_true(close.application, "Expected an application close");
+	zassert_equal(close.error_code, code, "Error code 0x%" PRIx64 ", expected 0x%" PRIx64,
+		      close.error_code, code);
 
 	close_h3_client();
 
@@ -1837,7 +1866,7 @@ ZTEST(server_h3_tests, test_h3_closed_control_stream_closes_connection)
 
 	end_client_stream(control_fd);
 
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_CLOSED_CRITICAL_STREAM);
 }
 
 ZTEST(server_h3_tests, test_h3_closed_qpack_stream_closes_connection)
@@ -1853,7 +1882,7 @@ ZTEST(server_h3_tests, test_h3_closed_qpack_stream_closes_connection)
 
 	end_client_stream(qpack_fd);
 
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_CLOSED_CRITICAL_STREAM);
 }
 
 ZTEST(server_h3_tests, test_h3_reset_control_stream_closes_connection)
@@ -1866,7 +1895,7 @@ ZTEST(server_h3_tests, test_h3_reset_control_stream_closes_connection)
 
 	reset_client_stream(control_fd);
 
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_CLOSED_CRITICAL_STREAM);
 }
 
 ZTEST(server_h3_tests, test_h3_reset_qpack_stream_closes_connection)
@@ -1882,7 +1911,7 @@ ZTEST(server_h3_tests, test_h3_reset_qpack_stream_closes_connection)
 
 	reset_client_stream(qpack_fd);
 
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_CLOSED_CRITICAL_STREAM);
 }
 
 ZTEST(server_h3_tests, test_h3_malformed_settings_closes_connection)
@@ -1892,7 +1921,7 @@ ZTEST(server_h3_tests, test_h3_malformed_settings_closes_connection)
 
 	(void)send_control_stream_data(settings, sizeof(settings));
 
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_SETTINGS_ERROR);
 }
 
 ZTEST(server_h3_tests, test_h3_client_goaway_keeps_connection)
@@ -1916,7 +1945,7 @@ ZTEST(server_h3_tests, test_h3_client_goaway_keeps_connection)
 	 */
 	end_client_stream(control_fd);
 
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_CLOSED_CRITICAL_STREAM);
 }
 
 ZTEST(server_h3_tests, test_h3_get_captures_request_headers)
@@ -2420,7 +2449,7 @@ ZTEST(server_h3_tests, test_h3_reserved_frame_on_control_stream_is_connection_er
 
 		(void)send_control_stream_data(frames, sizeof(frames));
 
-		expect_connection_closed_and_server_alive();
+		expect_connection_error_and_server_alive(H3_FRAME_UNEXPECTED);
 	}
 }
 
@@ -2526,7 +2555,7 @@ ZTEST(server_h3_tests, test_h3_client_goaway_identifier_must_not_grow)
 
 	/* A larger one is a connection error */
 	(void)send_control_stream_data(growing, sizeof(growing));
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_ID_ERROR);
 }
 
 ZTEST(server_h3_tests, test_h3_malformed_client_goaway_closes_connection)
@@ -2541,13 +2570,13 @@ ZTEST(server_h3_tests, test_h3_malformed_client_goaway_closes_connection)
 	};
 
 	(void)send_control_stream_data(empty, sizeof(empty));
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_FRAME_ERROR);
 
 	close_h3_client();
 	connect_h3_client(NULL);
 
 	(void)send_control_stream_data(trailing_byte, sizeof(trailing_byte));
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_FRAME_ERROR);
 }
 
 ZTEST(server_h3_tests, test_h3_duplicate_critical_stream_closes_connection)
@@ -2583,7 +2612,7 @@ ZTEST(server_h3_tests, test_h3_duplicate_critical_stream_closes_connection)
 		second_fd = open_client_stream(QUIC_STREAM_UNIDIRECTIONAL);
 		send_all(second_fd, &stream_types[i], 1);
 
-		expect_connection_closed_and_server_alive();
+		expect_connection_error_and_server_alive(H3_STREAM_CREATION_ERROR);
 	}
 }
 
@@ -2601,7 +2630,7 @@ ZTEST(server_h3_tests, test_h3_push_stream_closes_connection)
 	push_fd = open_client_stream(QUIC_STREAM_UNIDIRECTIONAL);
 	send_all(push_fd, &stream_type, 1);
 
-	expect_connection_closed_and_server_alive();
+	expect_connection_error_and_server_alive(H3_STREAM_CREATION_ERROR);
 }
 
 static bool buffer_contains(const uint8_t *buf, size_t len, const char *str)
