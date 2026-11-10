@@ -690,6 +690,29 @@ static void close_h3_or_plain_client(struct http_client_ctx *client,
 	}
 }
 
+/*
+ * Close an HTTP/3 client for an error of the protocol: a connection error,
+ * for example a second control stream, is told to the peer with its HTTP/3
+ * code in an application CONNECTION_CLOSE (RFC 9114 ch. 8). Before the
+ * handshake is complete the QUIC layer sends a transport close with
+ * APPLICATION_ERROR instead. Any other error closes without a code.
+ */
+static void close_h3_client_for_error(struct http_client_ctx *client,
+				      struct zsock_pollfd fds[],
+				      int max_fds, int err)
+{
+	if (IS_ENABLED(CONFIG_HTTP_SERVER_VERSION_3) && client->is_h3 &&
+	    h3_is_connection_error(err)) {
+		uint64_t code = (uint64_t)-err;
+
+		(void)zsock_setsockopt(client->h3.conn_sock, ZSOCK_SOL_QUIC,
+				       ZSOCK_QUIC_SO_APPLICATION_CLOSE_CODE, &code,
+				       sizeof(code));
+	}
+
+	close_h3_or_plain_client(client, fds, max_fds);
+}
+
 static void client_timeout(struct k_work *work)
 {
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
@@ -1207,7 +1230,7 @@ static void handle_h3_conn_pollin(struct http_server_ctx *ctx, int i)
 		/* Hard error, connection is closing */
 		client = h3_find_client(ctx->fds[i].fd, &idx);
 		if (client != NULL) {
-			close_h3_or_plain_client(client, ctx->fds, ARRAY_SIZE(ctx->fds));
+			close_h3_client_for_error(client, ctx->fds, ARRAY_SIZE(ctx->fds), ret);
 		}
 
 		return;
@@ -1395,8 +1418,8 @@ static void handle_h3_uni_stream(struct http_server_ctx *ctx, int i,
 				 */
 				LOG_DBG("[%p] H3: stream fd %d rejected (%d), "
 					"closing connection", client, stream_fd, ret);
-				close_h3_or_plain_client(client, ctx->fds,
-							 ARRAY_SIZE(ctx->fds));
+				close_h3_client_for_error(client, ctx->fds,
+							  ARRAY_SIZE(ctx->fds), ret);
 			}
 
 			return;
@@ -1422,7 +1445,7 @@ critical_stream_failed:
 	 */
 	LOG_DBG("[%p] H3: critical stream fd %d failed (%d), closing connection",
 		client, stream_fd, ret);
-	close_h3_or_plain_client(client, ctx->fds, ARRAY_SIZE(ctx->fds));
+	close_h3_client_for_error(client, ctx->fds, ARRAY_SIZE(ctx->fds), ret);
 }
 
 /*
@@ -1463,8 +1486,8 @@ static void handle_h3_bidi_stream(struct http_server_ctx *ctx, int i,
 			if (ret < 0) {
 				LOG_ERR("[%p] H3: request completion on FIN failed (%d)",
 					client, ret);
-				close_h3_or_plain_client(client, ctx->fds,
-							 ARRAY_SIZE(ctx->fds));
+				close_h3_client_for_error(client, ctx->fds,
+							  ARRAY_SIZE(ctx->fds), ret);
 				return;
 			}
 		} else {
@@ -1496,7 +1519,7 @@ static void handle_h3_bidi_stream(struct http_server_ctx *ctx, int i,
 			LOG_ERR("HTTP request handling error (%d)", ret);
 		}
 
-		close_h3_or_plain_client(client, ctx->fds, ARRAY_SIZE(ctx->fds));
+		close_h3_client_for_error(client, ctx->fds, ARRAY_SIZE(ctx->fds), ret);
 
 	} else if (ret == 0) {
 		/* Response complete, shutdown+FIN already sent; clear poll slot */
