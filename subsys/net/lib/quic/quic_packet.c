@@ -564,8 +564,40 @@ static int handle_reset_stream_frame(struct quic_endpoint *ep,
 		", final_size=%" PRIu64,
 		ep, quic_get_by_ep(ep), stream_id, error_code, final_size);
 
+	/* RFC 9000 ch. 19.4: a RESET_STREAM for a send-only stream, that is a
+	 * unidirectional stream opened here, is a connection error of type
+	 * STREAM_STATE_ERROR.
+	 */
+	if (quic_stream_id_is_send_only(stream_id, ep->is_server)) {
+		NET_DBG("[EP:%p/%d] RESET_STREAM for send-only stream %" PRIu64,
+			ep, quic_get_by_ep(ep), stream_id);
+		quic_endpoint_send_connection_close(ep, QUIC_ERROR_STREAM_STATE_ERROR,
+						    "RESET_STREAM for a send-only stream");
+		return -EPROTO;
+	}
+
 	stream = quic_find_stream_by_id(ep, stream_id);
 	if (stream == NULL) {
+		/* A stream of ours that was never opened cannot be reset, as
+		 * it cannot take a STREAM or STOP_SENDING frame (RFC 9000
+		 * ch. 19.5, 19.8). One that is not found otherwise was closed
+		 * already.
+		 */
+		if (quic_stream_id_is_local(stream_id, ep->is_server)) {
+			struct quic_context *conn = quic_find_context(ep);
+
+			if (conn != NULL &&
+			    (stream_id >> 2) >= *quic_stream_id_counter(conn, stream_id)) {
+				NET_DBG("[EP:%p/%d] RESET_STREAM for stream %" PRIu64
+					" that was never opened",
+					ep, quic_get_by_ep(ep), stream_id);
+				quic_endpoint_send_connection_close(
+					ep, QUIC_ERROR_STREAM_STATE_ERROR,
+					"RESET_STREAM for a stream that was never opened");
+				return -EPROTO;
+			}
+		}
+
 		return pos;
 	}
 

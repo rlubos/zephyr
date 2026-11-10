@@ -1374,6 +1374,20 @@ static inline uint64_t *quic_stream_id_counter(struct quic_context *ctx, uint64_
 	return &ctx->stream_id_counter[(id_or_type & 2U) != 0U ? 1 : 0];
 }
 
+/* Whether a stream was opened at this end, from its ID (RFC 9000 ch. 2.1) */
+static inline bool quic_stream_id_is_local(uint64_t stream_id, bool is_server)
+{
+	return ((stream_id & 1U) != 0U) == is_server;
+}
+
+/* Whether a stream carries nothing from the peer: a unidirectional stream
+ * opened at this end (RFC 9000 ch. 2.1).
+ */
+static inline bool quic_stream_id_is_send_only(uint64_t stream_id, bool is_server)
+{
+	return (stream_id & 2U) != 0U && quic_stream_id_is_local(stream_id, is_server);
+}
+
 #if defined(CONFIG_QUIC_STATS_HISTORY)
 struct quic_closed_context_stats {
 	int id;
