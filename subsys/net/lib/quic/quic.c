@@ -6174,6 +6174,7 @@ static struct quic_context *quic_context_init(struct quic_context *ctx)
 	ctx->sock = -1;
 	ctx->accept_closed = false;
 	ctx->error_code = 0;
+	ctx->app_closed = false;
 	ctx->closed = false;
 	ctx->peer_closed = false;
 	memset(&ctx->peer_close, 0, sizeof(ctx->peer_close));

@@ -186,12 +186,19 @@ Ending and Aborting Streams
   the error code set with ``ZSOCK_QUIC_SO_STOP_SENDING_CODE``. Data still in
   flight is discarded.
 
+``zsock_close()`` on a stream whose end the peer has not sent yet asks the
+peer to stop sending the same way, unless the connection socket is closed
+already: the connection then ends with its last stream, and the peer is told
+nothing about the streams. A stream that a protocol expects to stay open for
+the life of the connection, such as the control stream of HTTP/3, is therefore
+closed only after the connection (:rfc:`9114` Section 6.2.1).
+
 To abandon the sending half instead of ending it, set the application error
 code with ``ZSOCK_QUIC_SO_RESET_STREAM_CODE`` first. ``shutdown(ZSOCK_SHUT_WR)``
-and ``zsock_close()`` then send RESET_STREAM with that code, and the peer's
-``zsock_recv()`` fails with ``ECONNRESET`` once it has read the data that
-reached it before the reset. A stream reset by the peer is read the same way
-(:rfc:`9000` Section 3.2).
+and ``zsock_close()`` then send RESET_STREAM with that code, unless the
+connection socket is closed already, and the peer's ``zsock_recv()`` fails with
+``ECONNRESET`` once it has read the data that reached it before the reset. A
+stream reset by the peer is read the same way (:rfc:`9000` Section 3.2).
 
 .. code-block:: c
 

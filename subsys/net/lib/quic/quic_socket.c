@@ -694,6 +694,7 @@ static int quic_ctx_close_vmeth(void *obj)
 	 * context.
 	 */
 	ctx->sock = -1;
+	ctx->app_closed = true;
 
 	quic_ctx_release_unaccepted(ctx);
 
@@ -2422,6 +2423,7 @@ static int quic_stream_setsockopt_ctx(void *obj, int level, int optname,
 static int quic_stream_close_vmeth(void *obj)
 {
 	struct quic_stream *stream = obj;
+	struct quic_context *conn = stream->conn;
 	struct quic_endpoint *ep;
 	int sock = stream->sock;
 	int state;
@@ -2438,10 +2440,13 @@ static int quic_stream_close_vmeth(void *obj)
 	 * Send FIN to the peer to cleanly terminate the send side of the stream,
 	 * or RESET_STREAM when the application abandoned it. Skip if:
 	 *   - No endpoint (connection already gone)
+	 *   - The application closed the connection: it ends with its last
+	 *     stream, and the peer is told nothing about the streams
 	 *   - Stream was reset (RESET_STREAM already sent/received)
 	 *   - FIN was already sent (DATA_SENT or DATA_RECVD)
 	 */
-	if (ep != NULL && (ep->crypto.application.initialized || quic_early_data_is_armed(ep))) {
+	if (ep != NULL && (ep->crypto.application.initialized || quic_early_data_is_armed(ep)) &&
+	    (conn == NULL || !conn->app_closed)) {
 		if (stream->reset_sending) {
 			(void)quic_stream_reset_sending(stream, ep);
 		} else {
@@ -2456,6 +2461,18 @@ static int quic_stream_close_vmeth(void *obj)
 			    state != STATE_DATA_READ) {
 				(void)quic_send_stream_fin(stream, ep);
 			}
+		}
+
+		/* The peer is told to stop sending on a stream closed before
+		 * its final size is known (RFC 9000 ch. 3.5), unless it was
+		 * told at a shutdown already or cannot send on the stream: it
+		 * then ends the stream with RESET_STREAM, and the credit of
+		 * what it sent since comes back with it.
+		 */
+		if (!stream->final_size_known && !stream->read_closed &&
+		    !quic_stream_id_is_send_only(stream->id, ep->is_server)) {
+			(void)quic_send_stop_sending(ep, stream->id,
+						     stream->stop_sending_error_code);
 		}
 	}
 
@@ -2717,6 +2734,7 @@ int quic_connection_close(int sock)
 	 * quic_context_unref() below never reaches zero, leaving the context
 	 * pool slot occupied.
 	 */
+	ctx->app_closed = true;
 	quic_ctx_release_unaccepted(ctx);
 
 	(void)sock_obj_core_dealloc(ctx->sock);

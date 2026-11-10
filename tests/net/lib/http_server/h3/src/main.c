@@ -1216,8 +1216,17 @@ static void http_server_h3_before(void *fixture)
 	connect_h3_client(NULL);
 }
 
+/* The connection goes first: closing the server's control and QPACK streams
+ * while it is up would ask the server to stop sending on them, which closes
+ * a critical stream (RFC 9114 ch. 6.2.1).
+ */
 static void close_h3_client(void)
 {
+	if (client_conn_fd >= 0) {
+		(void)quic_connection_close(client_conn_fd);
+		client_conn_fd = -1;
+	}
+
 	for (size_t i = 0; i < tracked_stream_count; i++) {
 		if (tracked_stream_fds[i] < 0) {
 			continue;
@@ -1227,11 +1236,6 @@ static void close_h3_client(void)
 	}
 
 	tracked_stream_count = 0;
-
-	if (client_conn_fd >= 0) {
-		(void)quic_connection_close(client_conn_fd);
-		client_conn_fd = -1;
-	}
 
 	k_msleep(100);
 }

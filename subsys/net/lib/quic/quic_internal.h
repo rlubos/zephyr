@@ -1374,6 +1374,11 @@ __net_socket struct quic_context {
 	/** Error code to be passed to application when connection is closed. */
 	int error_code;
 
+	/** Closed by the application: the connection ends with its last
+	 * stream, and the peer is told nothing about the streams closed since.
+	 */
+	bool app_closed;
+
 	/** The connection was closed, by the peer or by its endpoint going
 	 * away. Reported as POLLHUP, whether or not streams are still waiting
 	 * to be accepted.
